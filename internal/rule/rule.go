@@ -29,8 +29,17 @@ type Rule struct {
 	Hosts    string `json:"hosts"`
 	Ports    string `json:"ports"`
 	Protocol string `json:"protocol"`
-	Action   string `json:"action"`
+	Action   string `json:"action"`          // PROXY / DIRECT / BLOCK
+	Proxy    string `json:"proxy,omitempty"` // proxy name for PROXY ("" = default)
 	Enabled  bool   `json:"enabled"`
+}
+
+// splitAction splits "PROXY@clash" into ("PROXY", "clash").
+func splitAction(s string) (action, proxy string) {
+	if i := strings.IndexByte(s, '@'); i >= 0 {
+		return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+1:])
+	}
+	return strings.TrimSpace(s), ""
 }
 
 // Action constants (mirror bpf.Action*).
@@ -86,13 +95,15 @@ func Parse(s string, id int) (Rule, error) {
 	if len(parts) != 5 {
 		return Rule{}, fmt.Errorf("invalid rule %q: want process:hosts:ports:protocol:action", s)
 	}
+	act, proxy := splitAction(parts[4])
 	r := Rule{
 		ID:       id,
 		Process:  strings.TrimSpace(parts[0]),
 		Hosts:    strings.TrimSpace(parts[1]),
 		Ports:    strings.TrimSpace(parts[2]),
 		Protocol: strings.ToUpper(strings.TrimSpace(parts[3])),
-		Action:   strings.ToUpper(strings.TrimSpace(parts[4])),
+		Action:   strings.ToUpper(act),
+		Proxy:    proxy,
 		Enabled:  true,
 	}
 	if _, err := protoBits(r.Protocol); err != nil {
@@ -106,7 +117,11 @@ func Parse(s string, id int) (Rule, error) {
 
 // String renders the rule back to its textual form.
 func (r Rule) String() string {
-	return fmt.Sprintf("%s:%s:%s:%s:%s", r.Process, r.Hosts, r.Ports, r.Protocol, r.Action)
+	action := r.Action
+	if r.Proxy != "" {
+		action += "@" + r.Proxy
+	}
+	return fmt.Sprintf("%s:%s:%s:%s:%s", r.Process, r.Hosts, r.Ports, r.Protocol, action)
 }
 
 func splitList(s string) []string {
@@ -250,12 +265,19 @@ func parseRange(s string) (uint16, uint16, error) {
 
 // Expand flattens the user rules into the kernel table in list order. Rules
 // are evaluated top to bottom and the first match wins. Each kernel entry
-// carries the 1-based order of the user rule it came from so the hit can be
-// reported. Expansion stops when the kernel table is full.
-func Expand(rules []Rule) []bpf.Rule {
+// carries the 1-based order of the user rule it came from and the id of the
+// proxy to use (for PROXY rules). Expansion stops when the kernel table is
+// full.
+//
+// proxyID maps a proxy name to its id; it is called with "" for the default
+// proxy. It returns ok=false for an unknown name, which is reported as an
+// error.
+func Expand(rules []Rule, proxyID func(name string) (uint32, bool)) ([]bpf.Rule, error) {
 	var out []bpf.Rule
+	var firstErr error
+
 	add := func(order uint32, r Rule) {
-		if len(out) >= bpf.MaxRules {
+		if len(out) >= bpf.MaxRules || firstErr != nil {
 			return
 		}
 		if !r.Enabled {
@@ -271,11 +293,22 @@ func Expand(rules []Rule) []bpf.Rule {
 		}
 		hosts, err := resolveHosts(r.Hosts)
 		if err != nil {
+			firstErr = fmt.Errorf("rule #%d: %w", order, err)
 			return
 		}
 		ports, err := resolvePorts(r.Ports)
 		if err != nil {
+			firstErr = fmt.Errorf("rule #%d: %w", order, err)
 			return
+		}
+		var pid uint32
+		if action == ActionProxy {
+			id, ok := proxyID(r.Proxy)
+			if !ok {
+				firstErr = fmt.Errorf("rule #%d: unknown proxy %q", order, r.Proxy)
+				return
+			}
+			pid = id
 		}
 		procs := splitList(r.Process)
 		if len(procs) == 0 {
@@ -294,6 +327,7 @@ func Expand(rules []Rule) []bpf.Rule {
 						PortLo:  p.lo,
 						PortHi:  p.hi,
 						Ord:     order,
+						ProxyId: uint8(pid),
 						NameLen: uint8(nlen),
 						Proto:   proto,
 						Action:  action,
@@ -312,5 +346,5 @@ func Expand(rules []Rule) []bpf.Rule {
 	for i, r := range rules {
 		add(uint32(i+1), r)
 	}
-	return out
+	return out, firstErr
 }

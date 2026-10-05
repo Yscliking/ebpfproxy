@@ -14,6 +14,7 @@ type Event struct {
 	Proto   string
 	Action  string
 	Rule    uint32 // user rule order (1-based) that matched, 0 if none
+	Proxy   string // proxy name for PROXY flows
 	Pid     uint32
 	Process string
 	Dst     string
@@ -26,8 +27,12 @@ func (e Event) String() string {
 	if e.Rule > 0 {
 		rule = fmt.Sprintf("rule #%d", e.Rule)
 	}
-	s := fmt.Sprintf("[%s] %-3s %-6s %-8s pid=%-6d %-16s -> %s",
-		e.Time.Format("15:04:05"), e.Proto, e.Action, rule, e.Pid, e.Process, e.Dst)
+	via := ""
+	if e.Proxy != "" {
+		via = " via " + e.Proxy
+	}
+	s := fmt.Sprintf("[%s] %-3s %-6s %-8s pid=%-6d %-16s -> %s%s",
+		e.Time.Format("15:04:05"), e.Proto, e.Action, rule, e.Pid, e.Process, e.Dst, via)
 	if e.Err != "" {
 		s += "  (" + e.Err + ")"
 	}

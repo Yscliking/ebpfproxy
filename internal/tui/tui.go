@@ -14,6 +14,7 @@ import (
 	"ebpfproxy/internal/engine"
 	"ebpfproxy/internal/relay"
 	"ebpfproxy/internal/rule"
+	"ebpfproxy/internal/socks"
 )
 
 var (
@@ -95,6 +96,7 @@ func (in *input) end()  { in.cursor = len([]rune(in.value)) }
 
 type field struct {
 	label string
+	key   string // settings field identifier
 	input
 	cycle []string
 }
@@ -365,6 +367,7 @@ func (m *Model) updateRules(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				{label: "ports"},
 				{label: "protocol", cycle: []string{"TCP", "UDP", "BOTH"}},
 				{label: "action", cycle: []string{"PROXY", "DIRECT", "BLOCK"}},
+				{label: "proxy"},
 			},
 			onSave: func(v []string) error { return m.saveRule(-1, v) },
 		}
@@ -387,6 +390,7 @@ func (m *Model) updateRules(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				{label: "ports"},
 				{label: "protocol", cycle: []string{"TCP", "UDP", "BOTH"}},
 				{label: "action", cycle: []string{"PROXY", "DIRECT", "BLOCK"}},
+				{label: "proxy"},
 			},
 			onSave: func(v []string) error { return m.saveRule(idx, v) },
 		}
@@ -395,6 +399,7 @@ func (m *Model) updateRules(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.form.fields[2].set(r.Ports)
 		m.form.fields[3].set(strings.ToUpper(r.Protocol))
 		m.form.fields[4].set(strings.ToUpper(r.Action))
+		m.form.fields[5].set(r.Proxy)
 	case "d", "delete":
 		if len(m.rules) > 0 {
 			m.rules = append(m.rules[:m.cursor], m.rules[m.cursor+1:]...)
@@ -429,12 +434,27 @@ func (m *Model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			break
 		}
 		idx := m.setCur
+		key := fields[idx].key
 		m.form = &editForm{
 			title:  "Edit " + fields[idx].label,
 			fields: []*field{{label: fields[idx].label, cycle: fields[idx].cycle}},
-			onSave: func(v []string) error { return m.saveSetting(idx, v[0]) },
+			onSave: func(v []string) error { return m.saveSetting(key, v[0]) },
 		}
 		m.form.fields[0].set(fields[idx].value)
+	case "a":
+		m.form = &editForm{
+			title: "Add proxy",
+			fields: []*field{
+				{label: "name"},
+				{label: "addr"},
+				{label: "user"},
+				{label: "pass"},
+			},
+			onSave: func(v []string) error { return m.addProxy(v) },
+		}
+		m.form.fields[1].set("127.0.0.1:1080")
+	case "d", "delete":
+		m.deleteProxy()
 	case "s":
 		cmd = m.startEngine()
 	case "x":
@@ -444,13 +464,81 @@ func (m *Model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) settingFields() []*field {
-	return []*field{
-		{label: "proxy_address", value: m.cfg.ProxyAddr},
-		{label: "default_action", value: strings.ToUpper(m.cfg.DefaultAction), cycle: []string{"DIRECT", "PROXY", "BLOCK"}},
-		{label: "tcp_relay_port", value: fmt.Sprint(m.cfg.TCPRelayPort)},
-		{label: "udp_relay_port", value: fmt.Sprint(m.cfg.UDPRelayPort)},
-		{label: "cgroup_path", value: m.cfg.CgroupPath},
-		{label: "log_level", value: logLevelName(m.cfg.LogLevel), cycle: []string{"OFF", "BLOCK", "PROXY", "ALL"}},
+	var out []*field
+	if len(m.cfg.Proxies) > 1 {
+		names := make([]string, len(m.cfg.Proxies))
+		for i, p := range m.cfg.Proxies {
+			names[i] = p.Name
+		}
+		out = append(out, &field{key: "default_proxy", label: "default_proxy", value: m.cfg.DefaultProxy, cycle: names})
+	}
+	for _, p := range m.cfg.Proxies {
+		out = append(out, &field{key: "proxy:" + p.Name, label: "proxy/" + p.Name, value: p.Addr})
+	}
+	out = append(out,
+		&field{key: "default_action", label: "default_action", value: strings.ToUpper(m.cfg.DefaultAction), cycle: []string{"DIRECT", "PROXY", "BLOCK"}},
+		&field{key: "tcp_relay_port", label: "tcp_relay_port", value: fmt.Sprint(m.cfg.TCPRelayPort)},
+		&field{key: "udp_relay_port", label: "udp_relay_port", value: fmt.Sprint(m.cfg.UDPRelayPort)},
+		&field{key: "cgroup_path", label: "cgroup_path", value: m.cfg.CgroupPath},
+		&field{key: "log_level", label: "log_level", value: logLevelName(m.cfg.LogLevel), cycle: []string{"OFF", "BLOCK", "PROXY", "ALL"}},
+	)
+	return out
+}
+
+// applyProxies pushes the current proxy list into the engine and re-expands rules.
+func (m *Model) applyProxies() error {
+	proxies := make([]engine.Proxy, 0, len(m.cfg.Proxies))
+	for _, p := range m.cfg.Proxies {
+		proxies = append(proxies, engine.Proxy{Name: p.Name, Client: socks.Client{Addr: p.Addr, User: p.User, Pass: p.Pass}})
+	}
+	m.eng.SetProxies(proxies, m.cfg.DefaultProxy)
+	if err := m.eng.ApplyRules(m.rules); err != nil {
+		return err
+	}
+	return config.Save(m.cfgPath, *m.cfg)
+}
+
+func (m *Model) addProxy(v []string) error {
+	name := strings.TrimSpace(v[0])
+	addr := strings.TrimSpace(v[1])
+	if name == "" || addr == "" {
+		return fmt.Errorf("proxy needs a name and an address")
+	}
+	if _, ok := m.cfg.ProxyByName(name); ok {
+		return fmt.Errorf("proxy %q already exists", name)
+	}
+	m.cfg.Proxies = append(m.cfg.Proxies, config.Proxy{Name: name, Addr: addr, User: strings.TrimSpace(v[2]), Pass: v[3]})
+	return m.applyProxies()
+}
+
+func (m *Model) deleteProxy() {
+	fields := m.settingFields()
+	if m.setCur < 0 || m.setCur >= len(fields) {
+		return
+	}
+	key := fields[m.setCur].key
+	if !strings.HasPrefix(key, "proxy:") {
+		m.errMsg = "select a proxy/<name> field to delete"
+		return
+	}
+	if len(m.cfg.Proxies) <= 1 {
+		m.errMsg = "at least one proxy is required"
+		return
+	}
+	name := strings.TrimPrefix(key, "proxy:")
+	kept := m.cfg.Proxies[:0]
+	for _, p := range m.cfg.Proxies {
+		if p.Name != name {
+			kept = append(kept, p)
+		}
+	}
+	m.cfg.Proxies = kept
+	m.cfg.Migrate()
+	if m.setCur >= len(m.settingFields()) {
+		m.setCur = len(m.settingFields()) - 1
+	}
+	if err := m.applyProxies(); err != nil {
+		m.errMsg = err.Error()
 	}
 }
 
@@ -523,12 +611,17 @@ func (m *Model) saveRule(idx int, v []string) error {
 	if _, err := rule.ParseAction(v[4]); err != nil {
 		return err
 	}
+	proxy := ""
+	if len(v) > 5 {
+		proxy = strings.TrimSpace(v[5])
+	}
 	r := rule.Rule{
 		Process:  v[0],
 		Hosts:    v[1],
 		Ports:    v[2],
 		Protocol: strings.ToUpper(v[3]),
 		Action:   strings.ToUpper(v[4]),
+		Proxy:    proxy,
 		Enabled:  true,
 	}
 	switch strings.ToUpper(r.Protocol) {
@@ -538,6 +631,14 @@ func (m *Model) saveRule(idx int, v []string) error {
 	}
 	if r.Process == "" {
 		return fmt.Errorf("process must not be empty")
+	}
+	if r.Proxy != "" && !strings.EqualFold(r.Action, "PROXY") {
+		r.Proxy = ""
+	}
+	if r.Proxy != "" {
+		if _, ok := m.cfg.ProxyByName(r.Proxy); !ok {
+			return fmt.Errorf("unknown proxy %q (see Settings)", r.Proxy)
+		}
 	}
 	if idx >= 0 && idx < len(m.rules) {
 		r.ID = m.rules[idx].ID
@@ -550,12 +651,24 @@ func (m *Model) saveRule(idx int, v []string) error {
 	return m.applyRules()
 }
 
-func (m *Model) saveSetting(idx int, value string) error {
-	switch idx {
-	case 0:
-		m.cfg.ProxyAddr = value
-		m.eng.Proxy().Addr = value
-	case 1:
+func (m *Model) saveSetting(key, value string) error {
+	switch {
+	case key == "default_proxy":
+		if _, ok := m.cfg.ProxyByName(value); !ok {
+			return fmt.Errorf("unknown proxy %q", value)
+		}
+		m.cfg.DefaultProxy = value
+		return m.applyProxies()
+	case strings.HasPrefix(key, "proxy:"):
+		name := strings.TrimPrefix(key, "proxy:")
+		for i := range m.cfg.Proxies {
+			if m.cfg.Proxies[i].Name == name {
+				m.cfg.Proxies[i].Addr = strings.TrimSpace(value)
+				return m.applyProxies()
+			}
+		}
+		return fmt.Errorf("unknown proxy %q", name)
+	case key == "default_action":
 		a, err := rule.ParseAction(value)
 		if err != nil {
 			return err
@@ -564,21 +677,21 @@ func (m *Model) saveSetting(idx int, value string) error {
 		if err := m.eng.SetDefaultAction(a); err != nil {
 			return err
 		}
-	case 2:
+	case key == "tcp_relay_port":
 		var p uint16
 		if _, err := fmt.Sscanf(value, "%d", &p); err != nil || p == 0 {
 			return fmt.Errorf("invalid port")
 		}
 		m.cfg.TCPRelayPort = p
-	case 3:
+	case key == "udp_relay_port":
 		var p uint16
 		if _, err := fmt.Sscanf(value, "%d", &p); err != nil || p == 0 {
 			return fmt.Errorf("invalid port")
 		}
 		m.cfg.UDPRelayPort = p
-	case 4:
+	case key == "cgroup_path":
 		m.cfg.CgroupPath = value
-	case 5:
+	case key == "log_level":
 		lv := logLevelValue(value)
 		if lv < 0 {
 			return fmt.Errorf("log level must be OFF, BLOCK, PROXY or ALL")
@@ -687,8 +800,12 @@ func (m *Model) View() string {
 	if m.eng.Running() {
 		state = styleOK.Render("RUNNING")
 	}
-	proxy := m.cfg.ProxyAddr
-	b.WriteString(fmt.Sprintf(" state=%s  proxy=%s  default=%s\n\n", state, proxy, strings.ToUpper(m.cfg.DefaultAction)))
+	proxy := ""
+	if p, ok := m.cfg.ProxyByName(m.cfg.DefaultProxy); ok {
+		proxy = p.Name + "=" + p.Addr
+	}
+	b.WriteString(fmt.Sprintf(" state=%s  proxy=%s  default=%s  proxies=%d\n\n",
+		state, proxy, strings.ToUpper(m.cfg.DefaultAction), len(m.cfg.Proxies)))
 
 	for i, name := range tabNames {
 		if i == m.active {
@@ -731,7 +848,7 @@ func (m *Model) help() string {
 	case tabRules:
 		return "↑/↓: select · k/j: move up/down · a: add · e/enter: edit · d: delete · space: toggle · " + base
 	case tabSettings:
-		return "↑/↓: select · enter: edit · " + base
+		return "↑/↓: select · enter: edit · a: add proxy · d: delete proxy · " + base
 	case tabLogs:
 		return "j/k or ↑/↓: scroll · enter/f: fullscreen · c: clear · " + base
 	}
@@ -763,7 +880,7 @@ func (m *Model) viewStatus() string {
 
 func (m *Model) viewRules() string {
 	var b strings.Builder
-	b.WriteString(styleHeader.Render(fmt.Sprintf("%-5s %-16s %-18s %-12s %-6s %-8s %s", "#", "PROCESS", "HOSTS", "PORTS", "PROTO", "ACTION", "ON")) + "\n")
+	b.WriteString(styleHeader.Render(fmt.Sprintf("%-5s %-16s %-18s %-12s %-6s %-16s %s", "#", "PROCESS", "HOSTS", "PORTS", "PROTO", "ACTION", "ON")) + "\n")
 	if len(m.rules) == 0 {
 		b.WriteString(styleOverlay.Render("  no rules; press 'a' to add one (unmatched traffic is DIRECT by default)") + "\n")
 		return b.String()
@@ -773,9 +890,13 @@ func (m *Model) viewRules() string {
 		if !r.Enabled {
 			on = "no"
 		}
-		line := fmt.Sprintf("%-5d %-16s %-18s %-12s %-6s %-8s %s",
+		action := strings.ToUpper(r.Action)
+		if r.Proxy != "" {
+			action += "@" + r.Proxy
+		}
+		line := fmt.Sprintf("%-5d %-16s %-18s %-12s %-6s %-16s %s",
 			i+1, truncate(r.Process, 16), truncate(r.Hosts, 18), truncate(r.Ports, 12),
-			strings.ToUpper(r.Protocol), strings.ToUpper(r.Action), on)
+			strings.ToUpper(r.Protocol), truncate(action, 16), on)
 		if i == m.cursor {
 			line = styleSel.Render(line)
 		}
@@ -886,6 +1007,12 @@ func (m *Model) overlay(bg string) string {
 	}
 	if len(f.fields) == 1 && len(f.fields[0].cycle) > 0 {
 		b.WriteString(styleHelp.Render("\n space cycles values") + "\n")
+	}
+	for _, fld := range f.fields {
+		if fld.label == "proxy" {
+			b.WriteString(styleHelp.Render(fmt.Sprintf("\n proxy: a name, empty = default (%s); list in Settings\n", m.cfg.DefaultProxy)))
+			break
+		}
 	}
 	b.WriteString(styleHelp.Render("\n tab: next · enter: save · esc: cancel") + "\n")
 	return bg + "\n" + styleModal.Render(b.String())

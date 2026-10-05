@@ -19,7 +19,7 @@ import (
 	"ebpfproxy/internal/tui"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 type stringSlice []string
 
@@ -32,8 +32,8 @@ func (s *stringSlice) Set(v string) error {
 func main() {
 	var (
 		configPath    = flag.String("config", config.Path(), "configuration file path")
-		proxyFlag     = flag.String("proxy", "", "SOCKS5 proxy (host:port or socks5://host:port)")
 		defaultAction = flag.String("default-action", "", "action for unmatched traffic: DIRECT, PROXY or BLOCK")
+		defaultProxy  = flag.String("default-proxy", "", "name of the default proxy")
 		tcpPort       = flag.Uint("tcp-relay-port", 0, "local TCP relay port")
 		udpPort       = flag.Uint("udp-relay-port", 0, "local UDP relay port")
 		cgroupPath    = flag.String("cgroup", "", "cgroup v2 path to attach hooks to")
@@ -43,8 +43,10 @@ func main() {
 		showHelp      = flag.Bool("help", false, "show help and exit")
 		showHelpShort = flag.Bool("h", false, "show help and exit")
 		rulesFlag     stringSlice
+		proxyFlags    stringSlice
 	)
 	flag.Var(&rulesFlag, "rule", "rule: process:hosts:ports:protocol:action (repeatable)")
+	flag.Var(&proxyFlags, "proxy", "SOCKS5 proxy: [name=]addr or [name=]socks5://user:pass@addr (repeatable)")
 	flag.Usage = printHelp
 	flag.Parse()
 
@@ -63,10 +65,13 @@ func main() {
 		cfg = config.Default()
 	}
 
-	if *proxyFlag != "" {
-		addr, user, pass := parseProxy(*proxyFlag)
-		cfg.ProxyAddr, cfg.ProxyUser, cfg.ProxyPass = addr, user, pass
+	for _, spec := range proxyFlags {
+		upsertProxy(&cfg, spec)
 	}
+	if *defaultProxy != "" {
+		cfg.DefaultProxy = *defaultProxy
+	}
+	cfg.Migrate()
 	if *defaultAction != "" {
 		cfg.DefaultAction = strings.ToUpper(*defaultAction)
 	}
@@ -110,9 +115,18 @@ func main() {
 		fmt.Fprintln(os.Stderr, "warning: root is required to load eBPF programs")
 	}
 
+	proxies := make([]engine.Proxy, 0, len(cfg.Proxies))
+	for _, p := range cfg.Proxies {
+		proxies = append(proxies, engine.Proxy{
+			Name:   p.Name,
+			Client: socks.Client{Addr: p.Addr, User: p.User, Pass: p.Pass},
+		})
+	}
+
 	eng := engine.New(engine.Config{
 		CgroupPath:    cfg.CgroupPath,
-		Proxy:         socks.Client{Addr: cfg.ProxyAddr, User: cfg.ProxyUser, Pass: cfg.ProxyPass},
+		Proxies:       proxies,
+		DefaultProxy:  cfg.DefaultProxy,
 		DefaultAction: da,
 		TCPRelayPort:  cfg.TCPRelayPort,
 		UDPRelayPort:  cfg.UDPRelayPort,
@@ -170,13 +184,19 @@ DESCRIPTION
   Traffic that matches no rule uses the default action (DIRECT by default).
 
 OPTIONS
-  --proxy <url>           SOCKS5 proxy. Accepted forms:
+  --proxy <spec>          SOCKS5 proxy (repeatable). Accepted forms:
                             host:port
-                            socks5://host:port
+                            name=host:port
                             socks5://user:pass@host:port
-                          Default: 127.0.0.1:1080
+                            name=socks5://user:pass@host:port
+                          A spec without a name updates the default proxy.
+                          Default: default=127.0.0.1:1080
+  --default-proxy <name>  Name of the default proxy (used by PROXY rules
+                          without an @name)
   --rule <rule>           Add a rule (repeatable, in evaluation order).
                           Format: process:hosts:ports:protocol:action
+                          For per-rule proxies use PROXY@<name>, e.g.
+                          PROXY@v2ray / PROXY@clash
   --default-action <a>    Action when no rule matches: DIRECT, PROXY or BLOCK
                           Default: DIRECT
   --tcp-relay-port <n>    Local TCP relay port (default 15001)
@@ -203,7 +223,7 @@ RULE SYNTAX
     ports     single port, range, or '*'; multiple with ';' or ','
               e.g. 443   8000-8100   80;443   53
     protocol  TCP, UDP or BOTH
-    action    PROXY, DIRECT or BLOCK
+    action    PROXY, DIRECT or BLOCK; for a specific proxy use PROXY@name
 
   Rules are evaluated top to bottom; the FIRST match wins and later rules are
   ignored. The connection log reports which rule order matched (rule #N). In
@@ -240,6 +260,15 @@ EXAMPLES
   sudo ebpfproxy --headless --proxy 127.0.0.1:1080 \
       --rule 'firefox:*:53:UDP:PROXY'
 
+  # Multiple proxies, chosen per application
+  sudo ebpfproxy --headless \
+      --proxy v2ray=127.0.0.1:1080 \
+      --proxy clash=127.0.0.1:1909 \
+      --proxy ss=127.0.0.1:1192 \
+      --rule 'a.exe:*:*:BOTH:PROXY@v2ray' \
+      --rule 'b.exe:*:*:BOTH:PROXY@clash' \
+      --rule 'c.exe:*:*:BOTH:PROXY@ss'
+
 NOTES
   - Root is required to load eBPF and to bind IP_TRANSPARENT sockets.
   - IPv4 only.
@@ -259,6 +288,41 @@ func parseLogLevel(s string) (int, error) {
 		return 3, nil
 	}
 	return 0, fmt.Errorf("want off, block, proxy or all")
+}
+
+// upsertProxy updates or appends a proxy from a --proxy spec:
+//
+//	addr                          update the default proxy's address
+//	name=addr                     upsert proxy "name"
+//	[name=]socks5://user:pass@addr
+func upsertProxy(cfg *config.Config, spec string) {
+	name := ""
+	rest := spec
+	if i := strings.IndexByte(spec, '='); i >= 0 {
+		name = strings.TrimSpace(spec[:i])
+		rest = spec[i+1:]
+	}
+	addr, user, pass := parseProxy(rest)
+	if addr == "" {
+		return
+	}
+	if name == "" {
+		idx := cfg.DefaultProxyIndex()
+		if idx < len(cfg.Proxies) {
+			cfg.Proxies[idx].Addr, cfg.Proxies[idx].User, cfg.Proxies[idx].Pass = addr, user, pass
+		} else {
+			cfg.Proxies = append(cfg.Proxies, config.Proxy{Name: "default", Addr: addr, User: user, Pass: pass})
+			cfg.DefaultProxy = "default"
+		}
+		return
+	}
+	for i := range cfg.Proxies {
+		if cfg.Proxies[i].Name == name {
+			cfg.Proxies[i].Addr, cfg.Proxies[i].User, cfg.Proxies[i].Pass = addr, user, pass
+			return
+		}
+	}
+	cfg.Proxies = append(cfg.Proxies, config.Proxy{Name: name, Addr: addr, User: user, Pass: pass})
 }
 
 func parseProxy(s string) (addr, user, pass string) {

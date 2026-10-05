@@ -9,6 +9,7 @@ This directory contains the project documentation. Start here.
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development archive: environment discovery, experiments, decisions, dead ends. |
 | [CHANGELOG.md](CHANGELOG.md) | Version history and the bugs fixed in each version. |
 | [TESTING.md](TESTING.md) | How to reproduce the functional tests (block / proxy / direct / UDP spoof / Firefox). |
+| [DNS-OVER-TOR.md](DNS-OVER-TOR.md) | Cookbook: local DoH resolver on port 53 routed through Tor (dnscrypt-proxy). |
 
 ## Project at a glance
 
@@ -31,4 +32,4 @@ headless CLI.
 - Control plane: `internal/engine`, `internal/rule`, `internal/bpf`
 - UI: `internal/tui`
 
-Version: `0.2.0`.
+Version: `0.3.0`.

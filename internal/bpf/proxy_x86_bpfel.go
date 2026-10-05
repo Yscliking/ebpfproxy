@@ -29,6 +29,7 @@ type proxyDstinfo struct {
 	Connected uint16
 	Pid       uint32
 	RuleOrd   uint32
+	ProxyId   uint32
 	Comm      [16]uint8
 }
 
@@ -45,7 +46,8 @@ type proxyRule struct {
 	Action   uint8
 	Enabled  uint8
 	Wildcard uint8
-	_        [3]byte
+	ProxyId  uint8
+	_        [2]byte
 }
 
 // Names of all BPF objects in the ELF.

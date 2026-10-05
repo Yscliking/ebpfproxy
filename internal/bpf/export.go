@@ -59,6 +59,7 @@ type Event struct {
 	Proto   uint8
 	Action  uint8
 	RuleOrd uint32
+	ProxyID uint32
 	Comm    [NameLen]uint8
 }
 

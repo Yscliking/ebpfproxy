@@ -2,6 +2,30 @@
 
 All notable changes to `ebpfproxy`, and the bugs fixed in each version.
 
+## v0.3.0
+
+### Added
+
+- **Multiple SOCKS5 proxies with per-rule selection.** Configure a named proxy
+  list (`proxies` in the config, or repeated `--proxy [name=]addr`), then pin a
+  rule to a proxy with `PROXY@<name>`, e.g.
+  `firefox:*:*:BOTH:PROXY@clash`. Proxies without `@name` (or `""`) use the
+  default proxy (`--default-proxy`).
+- The chosen proxy id travels through the kernel side channel
+  (`struct rule.proxy_id` → `struct dstinfo.proxy_id` → event) so the TCP relay
+  dials the right proxy and the UDP relay keeps **one association per proxy**.
+  Replies are routed by `(proxy id, remote)`.
+- Logs show the proxy for PROXY flows, e.g. `... -> 1.1.1.1:443 via v2ray`.
+- TUI: the rule form has a **proxy** field; Settings lists each proxy
+  (`proxy/<name>`) and a `default_proxy` selector, with `a` to add and `d` to
+  delete a proxy.
+- Legacy single-proxy configs (`proxy_addr` / user / pass) are migrated to a
+  proxy named `default` automatically.
+
+### Changed
+
+- Version bumped to `0.3.0`.
+
 ## v0.2.0
 
 ### Changed

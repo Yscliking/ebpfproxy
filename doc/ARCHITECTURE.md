@@ -115,8 +115,11 @@ Cases:
 | UDP unconnected | `sendmsg4` directly | local port (`ctx->sk->src_port`, already bound) |
 
 `struct dstinfo` carries `ip`, `port` (host order), a `connected` flag, `pid`,
-`rule_ord` (the user rule order that matched) and `comm` so the UI can show the
-originating process and the rule that hit.
+`rule_ord` (the user rule order that matched), `proxy_id` (which configured
+SOCKS5 proxy to use) and `comm` so the UI can show the originating process, the
+rule that hit and the proxy. The TCP relay dials `ProxyFor(proxy_id)`; the UDP
+relay keeps one association per proxy id and routes replies by
+`(proxy_id, remote)`.
 
 ## 5. Userspace relays
 

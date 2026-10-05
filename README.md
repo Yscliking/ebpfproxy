@@ -16,6 +16,8 @@ traffic through a **SOCKS5** proxy, without the app knowing.
 - Manages **TCP and UDP** (IPv4).
 - Per-process **rules**: `PROXY`, `DIRECT`, `BLOCK`.
 - **Transparent SOCKS5 proxying** — works for proxy-unaware apps.
+- **Multiple proxies per app** — give each rule its own SOCKS5 proxy
+  (`PROXY@v2ray`, `PROXY@clash`, …).
 - **Protect your IP** — force chosen apps through the proxy.
 - Ordered rules, **first match wins**; logs show which rule hit.
 - **Exact or prefix** process match: `git` matches only `git`, `git*` matches
@@ -88,7 +90,27 @@ process:hosts:ports:protocol:action
 - `hosts` — IPv4 / CIDR / hostname / `*`; multiple with `;` / `,`
 - `ports` — port, range, or `*`; multiple with `;` / `,`
 - `protocol` — `TCP`, `UDP` or `BOTH`
-- `action` — `PROXY`, `DIRECT` or `BLOCK`
+- `action` — `PROXY`, `DIRECT` or `BLOCK`; optionally `PROXY@<proxy>` to pick a
+  specific configured proxy (no `@` = the default proxy)
+
+### Multiple proxies
+
+Configure named proxies (config `proxies`, or repeat `--proxy`):
+
+```sh
+sudo ./ebpfproxy --headless \
+  --proxy v2ray=127.0.0.1:1080 \
+  --proxy clash=127.0.0.1:1909 \
+  --proxy ss=127.0.0.1:1192 \
+  --rule 'a.exe:*:*:BOTH:PROXY@v2ray' \
+  --rule 'b.exe:*:*:BOTH:PROXY@clash' \
+  --rule 'c.exe:*:*:BOTH:PROXY@ss'
+```
+
+Each flow is dialed through the proxy selected by its rule; logs show it
+(`-> 1.1.1.1:443 via v2ray`). `--default-proxy <name>` chooses which proxy
+rules without `@name` use. In the TUI, edit proxies in **Settings** (`a` add,
+`d` delete) and put the proxy name in the rule's **proxy** field.
 
 ### Matched rules and logs
 
@@ -127,4 +149,5 @@ column); use `k` / `j` to move a rule up or down.
 ## Docs
 
 See [`doc/`](doc/) for architecture, implementation, development notes,
-changelog and testing.
+changelog and testing — plus the [DNS-over-Tor cookbook](doc/DNS-OVER-TOR.md)
+for running a local DoH resolver on port 53 through a proxy.

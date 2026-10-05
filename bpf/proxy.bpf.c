@@ -46,6 +46,7 @@ struct rule {
 	__u8  action;	/* ACTION_* */
 	__u8  enabled;
 	__u8  wildcard;	/* 1 = prefix match ('git*'), 0 = exact match ('git') */
+	__u8  proxy_id;	/* index into the userspace SOCKS5 proxy list */
 };
 
 struct cfg {
@@ -65,6 +66,7 @@ struct event {
 	__u8  proto;	/* PROTO_TCP | PROTO_UDP */
 	__u8  action;	/* ACTION_* */
 	__u32 rule_ord;
+	__u32 proxy_id;
 	__u8  comm[NAME_LEN];
 };
 
@@ -74,6 +76,7 @@ struct dstinfo {
 	__u16 connected;
 	__u32 pid;
 	__u32 rule_ord;	/* order of the rule that matched, 1-based */
+	__u32 proxy_id;	/* SOCKS5 proxy index for PROXY flows */
 	__u8  comm[NAME_LEN];
 };
 
@@ -165,6 +168,7 @@ struct match_ctx {
 	__u8 exe[RULE_NAME_MAX];
 	__u32 ip;
 	__u32 rule_ord;	/* order of the matched rule */
+	__u32 proxy_id;	/* proxy index of the matched rule */
 	__u16 port;
 	__u8 proto;
 	__u8 action;
@@ -222,14 +226,17 @@ static long match_rule_cb(__u32 i, void *data)
 
 	m->action = r->action;
 	m->rule_ord = r->ord;
+	m->proxy_id = r->proxy_id;
 	m->found = 1;
 	return 1; /* stop iterating */
 }
 
 /* Returns the action to apply for this flow and stores the order of the
- * matched rule (1-based, 0 when the default action is used) in *rule_ord. */
+ * matched rule (1-based, 0 when the default action is used) in *rule_ord and
+ * the proxy index in *proxy_id. */
 static __always_inline __u8 match_rules(const __u8 *comm, __u32 ip, __u16 port,
-					__u8 want_proto, __u32 *rule_ord)
+					__u8 want_proto, __u32 *rule_ord,
+					__u32 *proxy_id)
 {
 	__u32 zero = 0;
 	struct cfg *c = bpf_map_lookup_elem(&cfg_map, &zero);
@@ -249,6 +256,7 @@ static __always_inline __u8 match_rules(const __u8 *comm, __u32 ip, __u16 port,
 	m.proto = want_proto;
 	m.action = def;
 	m.rule_ord = 0;
+	m.proxy_id = 0;
 	m.found = 0;
 
 	__u32 n = c ? c->rule_count : 0;
@@ -258,18 +266,21 @@ static __always_inline __u8 match_rules(const __u8 *comm, __u32 ip, __u16 port,
 	bpf_loop(n, match_rule_cb, &m, 0);
 
 	*rule_ord = m.rule_ord;
+	*proxy_id = m.proxy_id;
 	return m.found ? m.action : def;
 }
 
 static __always_inline void fill_dstinfo(struct dstinfo *di, __u32 ip,
 					 __u32 nport, __u8 connected,
-					 __u32 rule_ord, const __u8 *comm)
+					 __u32 rule_ord, __u32 proxy_id,
+					 const __u8 *comm)
 {
 	di->ip = ip;
 	di->port = bpf_ntohs((__u16)nport);
 	di->connected = connected;
 	di->pid = bpf_get_current_pid_tgid() >> 32;
 	di->rule_ord = rule_ord;
+	di->proxy_id = proxy_id;
 #pragma clang loop unroll(full)
 	for (int i = 0; i < NAME_LEN; i++)
 		di->comm[i] = comm[i];
@@ -278,7 +289,7 @@ static __always_inline void fill_dstinfo(struct dstinfo *di, __u32 ip,
 /* Push a decision event to userspace, subject to the configured log level. */
 static __always_inline void emit_event(__u8 action, __u8 proto, __u32 ip,
 				       __u32 nport, __u32 rule_ord,
-				       const __u8 *comm)
+				       __u32 proxy_id, const __u8 *comm)
 {
 	__u32 zero = 0;
 	struct cfg *c = bpf_map_lookup_elem(&cfg_map, &zero);
@@ -304,6 +315,7 @@ static __always_inline void emit_event(__u8 action, __u8 proto, __u32 ip,
 	e->proto = proto;
 	e->action = action;
 	e->rule_ord = rule_ord;
+	e->proxy_id = proxy_id;
 #pragma clang loop unroll(full)
 	for (int i = 0; i < NAME_LEN; i++)
 		e->comm[i] = comm[i];
@@ -343,7 +355,8 @@ static __always_inline int decide4(struct bpf_sock_addr *ctx, __u8 want_proto,
 			pname[i] = comm[i];
 	}
 
-	action = match_rules(comm, ip, port, want_proto, &rule_ord);
+	__u32 proxy_id = 0;
+	action = match_rules(comm, ip, port, want_proto, &rule_ord, &proxy_id);
 
 	__u32 zero = 0;
 	struct cfg *c = bpf_map_lookup_elem(&cfg_map, &zero);
@@ -353,7 +366,7 @@ static __always_inline int decide4(struct bpf_sock_addr *ctx, __u8 want_proto,
 	if (action == ACTION_PROXY && (!c || relay == 0))
 		action = ACTION_DIRECT;
 
-	emit_event(action, want_proto, ip, ctx->user_port, rule_ord, pname);
+	emit_event(action, want_proto, ip, ctx->user_port, rule_ord, proxy_id, pname);
 
 	if (action == ACTION_BLOCK) {
 		stat_inc(STAT_BLOCK);
@@ -365,7 +378,7 @@ static __always_inline int decide4(struct bpf_sock_addr *ctx, __u8 want_proto,
 		return 1;
 	}
 
-	fill_dstinfo(&di, ip, ctx->user_port, connected, rule_ord, pname);
+	fill_dstinfo(&di, ip, ctx->user_port, connected, rule_ord, proxy_id, pname);
 
 	if (record_by_port) {
 		/* sendmsg4: local port is already assigned. */
@@ -433,6 +446,7 @@ int sockops_prog(struct bpf_sock_ops *skops)
 	v.connected = 1;
 	v.pid = di->pid;
 	v.rule_ord = di->rule_ord;
+	v.proxy_id = di->proxy_id;
 #pragma clang loop unroll(full)
 	for (int i = 0; i < NAME_LEN; i++)
 		v.comm[i] = di->comm[i];
@@ -457,6 +471,7 @@ int BPF_PROG(udp_sendmsg_prog, struct sock *sk, struct msghdr *msg, size_t len)
 	v.connected = 1;
 	v.pid = di->pid;
 	v.rule_ord = di->rule_ord;
+	v.proxy_id = di->proxy_id;
 #pragma clang loop unroll(full)
 	for (int i = 0; i < NAME_LEN; i++)
 		v.comm[i] = di->comm[i];

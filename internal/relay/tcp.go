@@ -13,12 +13,12 @@ import (
 // TCPRelay accepts connections that eBPF redirected to the local relay port
 // and forwards them to the original destination through SOCKS5.
 type TCPRelay struct {
-	Addr    string
-	Proxy   *socks.Client
-	Lookup  func(port uint32) (bpf.DstInfo, bool)
-	Resolve func(pid uint32) string
-	Events  chan<- Event
-	Logf    func(string, ...any)
+	Addr     string
+	ProxyFor func(id uint32) *socks.Client
+	Lookup   func(port uint32) (bpf.DstInfo, bool)
+	Resolve  func(pid uint32) string
+	Events   chan<- Event
+	Logf     func(string, ...any)
 
 	ln      net.Listener
 	mu      sync.Mutex
@@ -96,7 +96,11 @@ func (r *TCPRelay) handle(client net.Conn) {
 	dstAddr := &net.TCPAddr{IP: dstInfoIP(di.Ip), Port: int(di.Port)}
 	dst := dstAddr.String()
 
-	up, err := r.Proxy.DialTCP(dst)
+	proxy := r.proxyFor(di.ProxyId)
+	if proxy == nil {
+		return
+	}
+	up, err := proxy.DialTCP(dst)
 	if err != nil {
 		r.emit(Event{
 			Time: time.Now(), Proto: "TCP", Action: "PROXY", Rule: di.RuleOrd,
@@ -114,6 +118,13 @@ func (r *TCPRelay) handle(client net.Conn) {
 	}()
 
 	relayBidirectional(client, up)
+}
+
+func (r *TCPRelay) proxyFor(id uint32) *socks.Client {
+	if r.ProxyFor == nil {
+		return nil
+	}
+	return r.ProxyFor(id)
 }
 
 func (r *TCPRelay) procName(di bpf.DstInfo) string {

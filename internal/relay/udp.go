@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -28,11 +29,11 @@ var debugUDP = os.Getenv("EBPFPROXY_DEBUG") != ""
 // Replies to unconnected sockets are sent with the original remote address
 // spoofed as the source so proxy-unaware applications keep working.
 type UDPRelay struct {
-	Addr    string
-	Proxy   *socks.Client
-	Peek    func(port uint32) (bpf.DstInfo, bool)
-	Resolve func(pid uint32) string
-	Events  chan<- Event
+	Addr     string
+	ProxyFor func(id uint32) *socks.Client
+	Peek     func(port uint32) (bpf.DstInfo, bool)
+	Resolve  func(pid uint32) string
+	Events   chan<- Event
 
 	conn *net.UDPConn
 
@@ -43,7 +44,7 @@ type UDPRelay struct {
 	closing       bool
 
 	assocMu sync.Mutex
-	assoc   *socks.UDPAssoc
+	assocs  map[uint32]*socks.UDPAssoc
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -58,6 +59,7 @@ type udpFlow struct {
 	client    *net.UDPAddr
 	dst       *net.UDPAddr
 	connected bool
+	proxyID   uint32
 
 	mu       sync.Mutex
 	lastUsed time.Time
@@ -80,6 +82,7 @@ func (r *UDPRelay) Start() error {
 	r.spoofs = make(map[string]*net.UDPConn)
 	r.done = make(chan struct{})
 	r.errSeen = make(map[string]time.Time)
+	r.assocs = make(map[uint32]*socks.UDPAssoc)
 
 	r.wg.Add(2)
 	go r.readLoop()
@@ -114,6 +117,7 @@ func (r *UDPRelay) dispatch(client *net.UDPAddr, data []byte) {
 	}
 	dst := &net.UDPAddr{IP: dstInfoIP(di.Ip), Port: int(di.Port)}
 	connected := di.Connected == 1
+	proxyID := di.ProxyId
 	key := client.String() + "|" + dst.String()
 
 	r.mu.Lock()
@@ -125,19 +129,21 @@ func (r *UDPRelay) dispatch(client *net.UDPAddr, data []byte) {
 			client:    cloneUDPAddr(client),
 			dst:       cloneUDPAddr(dst),
 			connected: connected,
+			proxyID:   proxyID,
 			lastUsed:  time.Now(),
 		}
 		r.flows[key] = flow
-		rc := r.remoteClients[dst.String()]
+		rk := remoteKey(proxyID, dst.String())
+		rc := r.remoteClients[rk]
 		if rc == nil {
 			rc = make(map[*udpFlow]struct{})
-			r.remoteClients[dst.String()] = rc
+			r.remoteClients[rk] = rc
 		}
 		rc[flow] = struct{}{}
 	}
 	r.mu.Unlock()
 
-	assoc, err := r.ensureAssoc()
+	assoc, err := r.ensureAssoc(proxyID)
 	if err != nil {
 		r.emitErr(di, dst.String(), err)
 		return
@@ -148,51 +154,62 @@ func (r *UDPRelay) dispatch(client *net.UDPAddr, data []byte) {
 		if debugUDP {
 			fmt.Fprintf(os.Stderr, "udp: send to proxy failed flow=%s: %v\n", key, err)
 		}
-		r.dropAssoc(assoc)
+		r.dropAssoc(proxyID, assoc)
 		flow.close()
 	}
 }
 
-func (r *UDPRelay) ensureAssoc() (*socks.UDPAssoc, error) {
+func remoteKey(proxyID uint32, remote string) string {
+	return strconv.FormatUint(uint64(proxyID), 10) + "|" + remote
+}
+
+func (r *UDPRelay) ensureAssoc(id uint32) (*socks.UDPAssoc, error) {
 	r.assocMu.Lock()
 	defer r.assocMu.Unlock()
-	if r.assoc != nil {
-		return r.assoc, nil
+	if a := r.assocs[id]; a != nil {
+		return a, nil
 	}
-	a, err := r.Proxy.AssociateUDP()
+	var cli *socks.Client
+	if r.ProxyFor != nil {
+		cli = r.ProxyFor(id)
+	}
+	if cli == nil {
+		return nil, fmt.Errorf("no proxy configured for id %d", id)
+	}
+	a, err := cli.AssociateUDP()
 	if err != nil {
 		return nil, err
 	}
-	r.assoc = a
+	r.assocs[id] = a
 	r.wg.Add(1)
-	go r.assocReadLoop(a)
+	go r.assocReadLoop(id, a)
 	return a, nil
 }
 
-func (r *UDPRelay) dropAssoc(a *socks.UDPAssoc) {
+func (r *UDPRelay) dropAssoc(id uint32, a *socks.UDPAssoc) {
 	r.assocMu.Lock()
-	if r.assoc == a {
-		r.assoc = nil
+	if r.assocs[id] == a {
+		delete(r.assocs, id)
 	}
 	r.assocMu.Unlock()
 	a.Close()
 }
 
-func (r *UDPRelay) assocReadLoop(a *socks.UDPAssoc) {
+func (r *UDPRelay) assocReadLoop(id uint32, a *socks.UDPAssoc) {
 	defer r.wg.Done()
 	for {
 		src, payload, err := a.Receive()
 		if err != nil {
-			r.dropAssoc(a)
+			r.dropAssoc(id, a)
 			return
 		}
-		r.dispatchReply(src, payload)
+		r.dispatchReply(id, src, payload)
 	}
 }
 
-func (r *UDPRelay) dispatchReply(src *net.UDPAddr, payload []byte) {
+func (r *UDPRelay) dispatchReply(id uint32, src *net.UDPAddr, payload []byte) {
 	r.mu.Lock()
-	rc := r.remoteClients[src.String()]
+	rc := r.remoteClients[remoteKey(id, src.String())]
 	flows := make([]*udpFlow, 0, len(rc))
 	for f := range rc {
 		flows = append(flows, f)
@@ -200,7 +217,7 @@ func (r *UDPRelay) dispatchReply(src *net.UDPAddr, payload []byte) {
 	r.mu.Unlock()
 
 	if debugUDP {
-		fmt.Fprintf(os.Stderr, "udp: reply from %s -> %d flow(s), len=%d\n", src, len(flows), len(payload))
+		fmt.Fprintf(os.Stderr, "udp: reply from %s (proxy %d) -> %d flow(s), len=%d\n", src, id, len(flows), len(payload))
 	}
 	for _, f := range flows {
 		f.deliver(src, payload)
@@ -271,10 +288,11 @@ func (f *udpFlow) close() {
 
 	f.relay.mu.Lock()
 	delete(f.relay.flows, f.key)
-	if rc := f.relay.remoteClients[f.dst.String()]; rc != nil {
+	rk := remoteKey(f.proxyID, f.dst.String())
+	if rc := f.relay.remoteClients[rk]; rc != nil {
 		delete(rc, f)
 		if len(rc) == 0 {
-			delete(f.relay.remoteClients, f.dst.String())
+			delete(f.relay.remoteClients, rk)
 		}
 	}
 	f.relay.mu.Unlock()
@@ -365,10 +383,13 @@ func (r *UDPRelay) Close() {
 	}
 
 	r.assocMu.Lock()
-	a := r.assoc
-	r.assoc = nil
+	assocs := make([]*socks.UDPAssoc, 0, len(r.assocs))
+	for _, a := range r.assocs {
+		assocs = append(assocs, a)
+	}
+	r.assocs = nil
 	r.assocMu.Unlock()
-	if a != nil {
+	for _, a := range assocs {
 		a.Close()
 	}
 	waitTimeout(&r.wg, 2*time.Second)

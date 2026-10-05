@@ -17,10 +17,17 @@ import (
 	"ebpfproxy/internal/socks"
 )
 
+// Proxy is a named SOCKS5 endpoint.
+type Proxy struct {
+	Name   string
+	Client socks.Client
+}
+
 // Config configures the engine.
 type Config struct {
 	CgroupPath    string
-	Proxy         socks.Client
+	Proxies       []Proxy
+	DefaultProxy  string
 	DefaultAction uint8
 	TCPRelayPort  uint16
 	UDPRelayPort  uint16
@@ -38,6 +45,11 @@ type Engine struct {
 	reader   *ringbuf.Reader
 	Events   chan relay.Event
 
+	proxyMu        sync.RWMutex
+	proxies        []Proxy
+	proxyIDs       map[string]uint32
+	defaultProxyID uint32
+
 	mu      sync.Mutex
 	started bool
 }
@@ -47,11 +59,73 @@ func New(cfg Config) *Engine {
 	if cfg.CgroupPath == "" {
 		cfg.CgroupPath = "/sys/fs/cgroup"
 	}
-	return &Engine{
+	e := &Engine{
 		cfg:      cfg,
 		resolver: procname.New(),
 		Events:   make(chan relay.Event, 4096),
 	}
+	e.SetProxies(cfg.Proxies, cfg.DefaultProxy)
+	return e
+}
+
+// SetProxies replaces the proxy list and default proxy.
+func (e *Engine) SetProxies(proxies []Proxy, defaultName string) {
+	ids := make(map[string]uint32, len(proxies))
+	for i, p := range proxies {
+		if _, ok := ids[p.Name]; !ok {
+			ids[p.Name] = uint32(i)
+		}
+	}
+	var def uint32
+	if id, ok := ids[defaultName]; ok {
+		def = id
+	}
+	e.proxyMu.Lock()
+	e.proxies = proxies
+	e.proxyIDs = ids
+	e.defaultProxyID = def
+	e.proxyMu.Unlock()
+}
+
+// Proxies returns a copy of the configured proxies.
+func (e *Engine) Proxies() []Proxy {
+	e.proxyMu.RLock()
+	defer e.proxyMu.RUnlock()
+	return append([]Proxy(nil), e.proxies...)
+}
+
+// ProxyFor returns the client for a proxy id (falling back to the default).
+func (e *Engine) ProxyFor(id uint32) *socks.Client {
+	e.proxyMu.RLock()
+	defer e.proxyMu.RUnlock()
+	if len(e.proxies) == 0 {
+		return nil
+	}
+	if int(id) >= len(e.proxies) {
+		id = e.defaultProxyID
+	}
+	return &e.proxies[id].Client
+}
+
+// ProxyName returns the name for a proxy id.
+func (e *Engine) ProxyName(id uint32) string {
+	e.proxyMu.RLock()
+	defer e.proxyMu.RUnlock()
+	if int(id) >= len(e.proxies) {
+		return ""
+	}
+	return e.proxies[id].Name
+}
+
+// proxyID resolves a proxy name ("" = default) to its id.
+func (e *Engine) proxyID(name string) (uint32, bool) {
+	e.proxyMu.RLock()
+	defer e.proxyMu.RUnlock()
+	if name == "" {
+		return e.defaultProxyID, true
+	}
+	id, ok := e.proxyIDs[name]
+	return id, ok
 }
 
 // Start loads and attaches the eBPF programs and starts the relays.
@@ -74,11 +148,11 @@ func (e *Engine) Start() error {
 	}
 
 	tcp := &relay.TCPRelay{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", e.cfg.TCPRelayPort),
-		Proxy:   &e.cfg.Proxy,
-		Lookup:  mgr.LookupRedirTCP,
-		Resolve: e.resolver.Name,
-		Events:  e.Events,
+		Addr:     fmt.Sprintf("127.0.0.1:%d", e.cfg.TCPRelayPort),
+		ProxyFor: e.ProxyFor,
+		Lookup:   mgr.LookupRedirTCP,
+		Resolve:  e.resolver.Name,
+		Events:   e.Events,
 	}
 	if err := tcp.Start(); err != nil {
 		mgr.Close()
@@ -86,11 +160,11 @@ func (e *Engine) Start() error {
 	}
 
 	udp := &relay.UDPRelay{
-		Addr:    fmt.Sprintf("127.0.0.1:%d", e.cfg.UDPRelayPort),
-		Proxy:   &e.cfg.Proxy,
-		Peek:    mgr.PeekRedirUDP,
-		Resolve: e.resolver.Name,
-		Events:  e.Events,
+		Addr:     fmt.Sprintf("127.0.0.1:%d", e.cfg.UDPRelayPort),
+		ProxyFor: e.ProxyFor,
+		Peek:     mgr.PeekRedirUDP,
+		Resolve:  e.resolver.Name,
+		Events:   e.Events,
 	}
 	if err := udp.Start(); err != nil {
 		tcp.Close()
@@ -156,7 +230,11 @@ func (e *Engine) ApplyRules(rules []rule.Rule) error {
 }
 
 func (e *Engine) applyRulesLocked(rules []rule.Rule) error {
-	return e.mgr.SetRules(rule.Expand(rules))
+	kernel, err := rule.Expand(rules, e.proxyID)
+	if err != nil {
+		return err
+	}
+	return e.mgr.SetRules(kernel)
 }
 
 // SetDefaultAction changes the fallback action for unmatched traffic.
@@ -191,9 +269,6 @@ func (e *Engine) Stats() [bpf.StatCount]uint64 {
 	return e.mgr.Stats()
 }
 
-// Proxy returns a pointer to the configured proxy client.
-func (e *Engine) Proxy() *socks.Client { return &e.cfg.Proxy }
-
 // readEvents converts kernel decision events into UI events.
 func (e *Engine) readEvents(rd *ringbuf.Reader) {
 	for {
@@ -209,11 +284,16 @@ func (e *Engine) readEvents(rd *ringbuf.Reader) {
 		if proc == "" {
 			proc = e.resolver.Name(ev.Pid)
 		}
+		var proxyName string
+		if ev.Action == bpf.ActionProxy {
+			proxyName = e.ProxyName(ev.ProxyID)
+		}
 		e.push(relay.Event{
 			Time:    time.Now(),
 			Proto:   protoName(ev.Proto),
 			Action:  actionName(ev.Action),
 			Rule:    ev.RuleOrd,
+			Proxy:   proxyName,
 			Pid:     ev.Pid,
 			Process: proc,
 			Dst:     dstString(ev.Ip, ev.Port),
