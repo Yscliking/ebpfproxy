@@ -4,9 +4,14 @@ package engine
 
 import (
 	"fmt"
+	"net"
 	"sync"
+	"time"
+
+	"github.com/cilium/ebpf/ringbuf"
 
 	"ebpfproxy/internal/bpf"
+	"ebpfproxy/internal/procname"
 	"ebpfproxy/internal/relay"
 	"ebpfproxy/internal/rule"
 	"ebpfproxy/internal/socks"
@@ -19,16 +24,19 @@ type Config struct {
 	DefaultAction uint8
 	TCPRelayPort  uint16
 	UDPRelayPort  uint16
+	LogLevel      uint32
 	Rules         []rule.Rule
 }
 
 // Engine owns the running data path.
 type Engine struct {
-	cfg    Config
-	mgr    *bpf.Manager
-	tcp    *relay.TCPRelay
-	udp    *relay.UDPRelay
-	Events chan relay.Event
+	cfg      Config
+	mgr      *bpf.Manager
+	tcp      *relay.TCPRelay
+	udp      *relay.UDPRelay
+	resolver *procname.Resolver
+	reader   *ringbuf.Reader
+	Events   chan relay.Event
 
 	mu      sync.Mutex
 	started bool
@@ -39,7 +47,11 @@ func New(cfg Config) *Engine {
 	if cfg.CgroupPath == "" {
 		cfg.CgroupPath = "/sys/fs/cgroup"
 	}
-	return &Engine{cfg: cfg, Events: make(chan relay.Event, 2048)}
+	return &Engine{
+		cfg:      cfg,
+		resolver: procname.New(),
+		Events:   make(chan relay.Event, 4096),
+	}
 }
 
 // Start loads and attaches the eBPF programs and starts the relays.
@@ -55,16 +67,18 @@ func (e *Engine) Start() error {
 		DefaultAction: e.cfg.DefaultAction,
 		TCPRelayPort:  e.cfg.TCPRelayPort,
 		UDPRelayPort:  e.cfg.UDPRelayPort,
+		LogLevel:      e.cfg.LogLevel,
 	})
 	if err != nil {
 		return err
 	}
 
 	tcp := &relay.TCPRelay{
-		Addr:   fmt.Sprintf("127.0.0.1:%d", e.cfg.TCPRelayPort),
-		Proxy:  &e.cfg.Proxy,
-		Lookup: mgr.LookupRedirTCP,
-		Events: e.Events,
+		Addr:    fmt.Sprintf("127.0.0.1:%d", e.cfg.TCPRelayPort),
+		Proxy:   &e.cfg.Proxy,
+		Lookup:  mgr.LookupRedirTCP,
+		Resolve: e.resolver.Name,
+		Events:  e.Events,
 	}
 	if err := tcp.Start(); err != nil {
 		mgr.Close()
@@ -72,10 +86,11 @@ func (e *Engine) Start() error {
 	}
 
 	udp := &relay.UDPRelay{
-		Addr:   fmt.Sprintf("127.0.0.1:%d", e.cfg.UDPRelayPort),
-		Proxy:  &e.cfg.Proxy,
-		Peek:   mgr.PeekRedirUDP,
-		Events: e.Events,
+		Addr:    fmt.Sprintf("127.0.0.1:%d", e.cfg.UDPRelayPort),
+		Proxy:   &e.cfg.Proxy,
+		Peek:    mgr.PeekRedirUDP,
+		Resolve: e.resolver.Name,
+		Events:  e.Events,
 	}
 	if err := udp.Start(); err != nil {
 		tcp.Close()
@@ -83,10 +98,20 @@ func (e *Engine) Start() error {
 		return fmt.Errorf("start udp relay: %w", err)
 	}
 
+	rd, err := ringbuf.NewReader(mgr.EventsMap())
+	if err != nil {
+		udp.Close()
+		tcp.Close()
+		mgr.Close()
+		return fmt.Errorf("open event ring buffer: %w", err)
+	}
+
 	e.mgr = mgr
 	e.tcp = tcp
 	e.udp = udp
+	e.reader = rd
 	e.started = true
+	go e.readEvents(rd)
 	return e.applyRulesLocked(e.cfg.Rules)
 }
 
@@ -96,6 +121,9 @@ func (e *Engine) Stop() {
 	defer e.mu.Unlock()
 	if !e.started {
 		return
+	}
+	if e.reader != nil {
+		e.reader.Close()
 	}
 	if e.tcp != nil {
 		e.tcp.Close()
@@ -142,6 +170,17 @@ func (e *Engine) SetDefaultAction(action uint8) error {
 	return e.mgr.SetDefaultAction(action)
 }
 
+// SetLogLevel changes how much traffic is logged (0 off .. 3 all).
+func (e *Engine) SetLogLevel(level uint32) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.cfg.LogLevel = level
+	if !e.started {
+		return nil
+	}
+	return e.mgr.SetLogLevel(level)
+}
+
 // Stats returns the kernel counters.
 func (e *Engine) Stats() [bpf.StatCount]uint64 {
 	e.mu.Lock()
@@ -154,3 +193,68 @@ func (e *Engine) Stats() [bpf.StatCount]uint64 {
 
 // Proxy returns a pointer to the configured proxy client.
 func (e *Engine) Proxy() *socks.Client { return &e.cfg.Proxy }
+
+// readEvents converts kernel decision events into UI events.
+func (e *Engine) readEvents(rd *ringbuf.Reader) {
+	for {
+		rec, err := rd.Read()
+		if err != nil {
+			return
+		}
+		ev, err := bpf.ParseEvent(rec.RawSample)
+		if err != nil {
+			continue
+		}
+		proc := commStr(ev.Comm[:])
+		if proc == "" {
+			proc = e.resolver.Name(ev.Pid)
+		}
+		e.push(relay.Event{
+			Time:    time.Now(),
+			Proto:   protoName(ev.Proto),
+			Action:  actionName(ev.Action),
+			Rule:    ev.RuleOrd,
+			Pid:     ev.Pid,
+			Process: proc,
+			Dst:     dstString(ev.Ip, ev.Port),
+		})
+	}
+}
+
+func (e *Engine) push(ev relay.Event) {
+	select {
+	case e.Events <- ev:
+	default:
+	}
+}
+
+func actionName(a uint8) string {
+	switch a {
+	case bpf.ActionProxy:
+		return "PROXY"
+	case bpf.ActionBlock:
+		return "BLOCK"
+	default:
+		return "DIRECT"
+	}
+}
+
+func protoName(p uint8) string {
+	if p == bpf.ProtoUDP {
+		return "UDP"
+	}
+	return "TCP"
+}
+
+func dstString(ip uint32, port uint16) string {
+	b := []byte{byte(ip), byte(ip >> 8), byte(ip >> 16), byte(ip >> 24)}
+	return net.JoinHostPort(net.IP(b).String(), fmt.Sprint(port))
+}
+
+func commStr(comm []uint8) string {
+	n := 0
+	for n < len(comm) && comm[n] != 0 {
+		n++
+	}
+	return string(comm[:n])
+}

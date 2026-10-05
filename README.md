@@ -18,7 +18,12 @@ traffic through a **SOCKS5** proxy, without the app knowing.
 - **Transparent SOCKS5 proxying** — works for proxy-unaware apps.
 - **Protect your IP** — force chosen apps through the proxy.
 - Ordered rules, **first match wins**; logs show which rule hit.
-- No hidden rules. Loopback and non-unicast traffic is always direct.
+- **Exact or prefix** process match: `git` matches only `git`, `git*` matches
+  any `git...`.
+- **No hidden bypass.** Loopback, broadcast and link-local are NOT special —
+  every flow is decided by your rules and the default action.
+- **Traffic log** for proxy / direct / block, with the real program name, and a
+  full-screen viewer.
 
 ## Build
 
@@ -77,23 +82,33 @@ blocked rather than proxied.
 process:hosts:ports:protocol:action
 ```
 
-- `process` — name or prefix, matched against the task name **or** executable
-  basename; `*` = any; multiple with `;` / `,`
+- `process` — matched against the task `comm` **or** the executable basename.
+  `git` matches only `git`; `git*` matches any `git...`; `*` matches any;
+  multiple with `;` / `,`
 - `hosts` — IPv4 / CIDR / hostname / `*`; multiple with `;` / `,`
 - `ports` — port, range, or `*`; multiple with `;` / `,`
 - `protocol` — `TCP`, `UDP` or `BOTH`
 - `action` — `PROXY`, `DIRECT` or `BLOCK`
 
-### Matched rules
+### Matched rules and logs
 
-Every proxied connection is logged with the rule that matched:
+All traffic is logged with the **program name** (not the kernel thread name)
+and the rule that matched:
 
 ```
 [14:14:04] TCP PROXY  rule #1  pid=18012  firefox  -> 1.1.1.1:443
+[14:14:04] TCP DIRECT rule -   pid=18013  ebpfproxy -> 127.0.0.1:1080
+[14:14:04] TCP BLOCK  rule #2  pid=18014  curl     -> 10.0.0.5:22
 ```
 
-The Rules tab shows the order (`#` column); use `k` / `j` to move a rule up or
-down.
+Log volume is controlled by the **log level** (Settings tab or `--log-level`):
+`off`, `block`, `proxy` (default), `all`. The Rules tab shows the order (`#`
+column); use `k` / `j` to move a rule up or down.
+
+> **No implicit bypass:** the tool never silently skips traffic. Loopback,
+> broadcast and link-local flows are decided by your rules and default action
+> too. With a catch-all/default `PROXY`, always add `DIRECT` rules for loopback
+> and the proxy process (as in the guide above) or the proxy connection loops.
 
 ## TUI keys
 
@@ -105,6 +120,8 @@ down.
 | `k` / `j` | move rule up / down |
 | `a` / `e` / `d` | add / edit / delete rule |
 | `space` | enable/disable rule |
+| `enter` / `f` | (Logs tab) full-screen log viewer |
+| `j` / `k` | (Logs tab) scroll; in full screen `q`/`esc` back, `g`/`G` top/bottom |
 | `q` | quit (stops first) |
 
 ## Docs

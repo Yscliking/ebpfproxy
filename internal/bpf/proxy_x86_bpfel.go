@@ -19,6 +19,7 @@ type proxyCfg struct {
 	DefaultAction uint32
 	TcpRelayPort  uint32
 	UdpRelayPort  uint32
+	LogLevel      uint32
 }
 
 type proxyDstinfo struct {
@@ -32,17 +33,19 @@ type proxyDstinfo struct {
 }
 
 type proxyRule struct {
-	_       structs.HostLayout
-	Ip      uint32
-	Mask    uint32
-	PortLo  uint16
-	PortHi  uint16
-	Ord     uint32
-	Name    [64]uint8
-	NameLen uint8
-	Proto   uint8
-	Action  uint8
-	Enabled uint8
+	_        structs.HostLayout
+	Ip       uint32
+	Mask     uint32
+	PortLo   uint16
+	PortHi   uint16
+	Ord      uint32
+	Name     [64]uint8
+	NameLen  uint8
+	Proto    uint8
+	Action   uint8
+	Enabled  uint8
+	Wildcard uint8
+	_        [3]byte
 }
 
 // Names of all BPF objects in the ELF.
@@ -50,6 +53,7 @@ type proxyRule struct {
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
 	proxyMapCfgMap          = "cfg_map"
+	proxyMapEvents          = "events"
 	proxyMapPending         = "pending"
 	proxyMapRedirsTcp       = "redirs_tcp"
 	proxyMapRedirsUdp       = "redirs_udp"
@@ -114,6 +118,7 @@ type proxyProgramSpecs struct {
 // It can be passed ebpf.CollectionSpec.Assign.
 type proxyMapSpecs struct {
 	CfgMap    *ebpf.MapSpec `ebpf:"cfg_map"`
+	Events    *ebpf.MapSpec `ebpf:"events"`
 	Pending   *ebpf.MapSpec `ebpf:"pending"`
 	RedirsTcp *ebpf.MapSpec `ebpf:"redirs_tcp"`
 	RedirsUdp *ebpf.MapSpec `ebpf:"redirs_udp"`
@@ -148,6 +153,7 @@ func (o *proxyObjects) Close() error {
 // It can be passed to loadProxyObjects or ebpf.CollectionSpec.LoadAndAssign.
 type proxyMaps struct {
 	CfgMap    *ebpf.Map `ebpf:"cfg_map"`
+	Events    *ebpf.Map `ebpf:"events"`
 	Pending   *ebpf.Map `ebpf:"pending"`
 	RedirsTcp *ebpf.Map `ebpf:"redirs_tcp"`
 	RedirsUdp *ebpf.Map `ebpf:"redirs_udp"`
@@ -158,6 +164,7 @@ type proxyMaps struct {
 func (m *proxyMaps) Close() error {
 	return _ProxyClose(
 		m.CfgMap,
+		m.Events,
 		m.Pending,
 		m.RedirsTcp,
 		m.RedirsUdp,

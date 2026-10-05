@@ -171,6 +171,11 @@ very first after setup was lost.
   relay now force-closes in-flight connections on shutdown.
 - Hardcoded process rules (`opencode`, `v2ray`, …) were removed in favour of
   user-defined rules, and rules became explicitly orderable with hit reporting.
+- Process matching became exact-or-prefix (`git` vs `git*`), the implicit
+  loopback/non-unicast bypass was removed, and a ring buffer was added so
+  PROXY / DIRECT / BLOCK decisions are all logged (with log levels and a
+  full-screen viewer). Logs show the executable basename read in kernel, not the
+  thread `comm`.
 
 ## Testing harness kept around
 

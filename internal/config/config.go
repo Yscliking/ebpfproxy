@@ -18,6 +18,7 @@ type Config struct {
 	TCPRelayPort  uint16      `json:"tcp_relay_port"`
 	UDPRelayPort  uint16      `json:"udp_relay_port"`
 	CgroupPath    string      `json:"cgroup_path"`
+	LogLevel      int         `json:"log_level"`
 	Rules         []rule.Rule `json:"rules"`
 }
 
@@ -29,6 +30,7 @@ func Default() Config {
 		TCPRelayPort:  15001,
 		UDPRelayPort:  15002,
 		CgroupPath:    "/sys/fs/cgroup",
+		LogLevel:      2,
 		Rules:         []rule.Rule{},
 	}
 }

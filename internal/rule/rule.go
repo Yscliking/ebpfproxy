@@ -121,20 +121,27 @@ func splitList(s string) []string {
 	return out
 }
 
-// processPrefix turns a process pattern into a (prefix, length) pair. Only a
-// single trailing wildcard is supported; a leading '*' means "any process".
-func processPrefix(p string) (string, int) {
+// processPattern turns a process pattern into (name, length, wildcard):
+//
+//	"*"    -> ("",        0, true)   match any
+//	"git*" -> ("git",     3, true)   prefix match
+//	"git"  -> ("git",     3, false)  exact match
+//
+// A '*' anywhere truncates the pattern and makes it a prefix match.
+func processPattern(p string) (string, int, bool) {
 	p = strings.TrimSpace(p)
 	if p == "" || p == "*" {
-		return "", 0
+		return "", 0, true
 	}
+	wildcard := false
 	if i := strings.IndexByte(p, '*'); i >= 0 {
 		p = p[:i]
+		wildcard = true
 	}
 	if len(p) > bpf.RuleNameMax-1 {
 		p = p[:bpf.RuleNameMax-1]
 	}
-	return p, len(p)
+	return p, len(p), wildcard
 }
 
 type ipnet struct {
@@ -275,7 +282,7 @@ func Expand(rules []Rule) []bpf.Rule {
 			procs = []string{"*"}
 		}
 		for _, pr := range procs {
-			name, nlen := processPrefix(pr)
+			name, nlen, wildcard := processPattern(pr)
 			for _, h := range hosts {
 				for _, p := range ports {
 					if len(out) >= bpf.MaxRules {
@@ -291,6 +298,9 @@ func Expand(rules []Rule) []bpf.Rule {
 						Proto:   proto,
 						Action:  action,
 						Enabled: 1,
+					}
+					if wildcard {
+						kr.Wildcard = 1
 					}
 					copy(kr.Name[:], name)
 					out = append(out, kr)

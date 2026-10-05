@@ -2,6 +2,37 @@
 
 All notable changes to `ebpfproxy`, and the bugs fixed in each version.
 
+## v0.2.0
+
+### Changed
+
+- **Exact vs prefix process matching.** `git` now matches only `git`; use
+  `git*` for a prefix match. Implemented with a `wildcard` flag per kernel rule
+  (`bpf/proxy.bpf.c: name_match`).
+- **Removed all implicit bypasses.** Loopback, multicast/broadcast and
+  link-local traffic are no longer forced DIRECT; every flow is decided by the
+  rules and the default action. This means a catch-all/default `PROXY` requires
+  explicit `DIRECT` rules for loopback and the proxy process, otherwise the
+  relay's own connection would loop.
+- **Program name in logs instead of thread name.** The eBPF hook stores the
+  executable basename (already read for matching) so logs show `firefox`
+  instead of `Socket Thread` / `DNS Resolver`, and `git-remote-https` instead
+  of a truncated thread name. Userspace `/proc` lookup remains only as a
+  fallback.
+
+### Added
+
+- **Traffic log for every action.** A BPF ring buffer (`events`) carries
+  PROXY / DIRECT / BLOCK decisions to userspace, so the log is no longer
+  limited to proxied flows.
+- **Log level** setting (`off`, `block`, `proxy`, `all`), configurable in the
+  TUI Settings tab and with `--log-level`. The level is enforced in the kernel
+  to avoid overhead when logging is reduced.
+- **Full-screen log viewer** in the TUI: from the Logs tab press `enter`/`f`;
+  `j`/`k` scroll, `g`/`G` jump to top/bottom, `c` clears, `q`/`esc` returns.
+  The normal Logs tab also scrolls with `j`/`k` and keeps its position.
+- Version bumped to `0.2.0`.
+
 ## v0.1.3
 
 ### Added

@@ -127,15 +127,17 @@ type Model struct {
 	width  int
 	height int
 
-	rules    []rule.Rule
-	cursor   int
-	setCur   int
-	logs     []string
-	form     *editForm
-	errMsg   string
-	status   string
-	busy     bool
-	quitNext bool
+	rules     []rule.Rule
+	cursor    int
+	setCur    int
+	logs      []string
+	logScroll int
+	fullLogs  bool
+	form      *editForm
+	errMsg    string
+	status    string
+	busy      bool
+	quitNext  bool
 }
 
 // New creates the TUI model.
@@ -232,6 +234,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.logs) > 2000 {
 			m.logs = m.logs[len(m.logs)-1000:]
 		}
+		// Keep a scrolled-up window anchored when new lines arrive.
+		if m.logScroll > 0 {
+			m.logScroll++
+		}
 		return m, waitForEvent(m.eng.Events)
 	case tea.KeyMsg:
 		if m.form != nil {
@@ -243,6 +249,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.fullLogs {
+		return m.updateFullLogs(msg)
+	}
 	switch msg.String() {
 	case "ctrl+c":
 		if m.eng.Running() {
@@ -274,7 +283,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.updateRules(msg)
 	case tabSettings:
 		return m.updateSettings(msg)
-	case tabStatus, tabLogs:
+	case tabLogs:
 		switch msg.String() {
 		case "s":
 			return m, m.startEngine()
@@ -282,7 +291,48 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.stopEngine()
 		case "c":
 			m.logs = nil
+			m.logScroll = 0
+		case "k", "up":
+			m.scrollLogs(1)
+		case "j", "down":
+			m.scrollLogs(-1)
+		case "enter", "f":
+			m.fullLogs = true
+			m.logScroll = 0
 		}
+	case tabStatus:
+		switch msg.String() {
+		case "s":
+			return m, m.startEngine()
+		case "x":
+			return m, m.stopEngine()
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) scrollLogs(delta int) {
+	m.logScroll += delta
+	if m.logScroll < 0 {
+		m.logScroll = 0
+	}
+}
+
+func (m *Model) updateFullLogs(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc":
+		m.fullLogs = false
+	case "k", "up":
+		m.scrollLogs(1)
+	case "j", "down":
+		m.scrollLogs(-1)
+	case "g", "home":
+		m.logScroll = len(m.logs)
+	case "G", "end":
+		m.logScroll = 0
+	case "c":
+		m.logs = nil
+		m.logScroll = 0
 	}
 	return m, nil
 }
@@ -400,6 +450,7 @@ func (m *Model) settingFields() []*field {
 		{label: "tcp_relay_port", value: fmt.Sprint(m.cfg.TCPRelayPort)},
 		{label: "udp_relay_port", value: fmt.Sprint(m.cfg.UDPRelayPort)},
 		{label: "cgroup_path", value: m.cfg.CgroupPath},
+		{label: "log_level", value: logLevelName(m.cfg.LogLevel), cycle: []string{"OFF", "BLOCK", "PROXY", "ALL"}},
 	}
 }
 
@@ -527,10 +578,33 @@ func (m *Model) saveSetting(idx int, value string) error {
 		m.cfg.UDPRelayPort = p
 	case 4:
 		m.cfg.CgroupPath = value
+	case 5:
+		lv := logLevelValue(value)
+		if lv < 0 {
+			return fmt.Errorf("log level must be OFF, BLOCK, PROXY or ALL")
+		}
+		m.cfg.LogLevel = lv
+		if err := m.eng.SetLogLevel(uint32(lv)); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unknown setting")
 	}
 	return config.Save(m.cfgPath, *m.cfg)
+}
+
+func logLevelValue(s string) int {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "OFF":
+		return 0
+	case "BLOCK":
+		return 1
+	case "PROXY":
+		return 2
+	case "ALL":
+		return 3
+	}
+	return -1
 }
 
 func (m *Model) applyRules() error {
@@ -603,6 +677,9 @@ func verifyStopped(eng *engine.Engine, tcpPort, udpPort uint16) string {
 }
 
 func (m *Model) View() string {
+	if m.fullLogs {
+		return m.viewFullLogs()
+	}
 	var b strings.Builder
 	b.WriteString(styleTitle.Render(" ebpfproxy · eBPF TCP/UDP process traffic manager ") + "\n")
 
@@ -656,7 +733,7 @@ func (m *Model) help() string {
 	case tabSettings:
 		return "↑/↓: select · enter: edit · " + base
 	case tabLogs:
-		return "c: clear logs · " + base
+		return "j/k or ↑/↓: scroll · enter/f: fullscreen · c: clear · " + base
 	}
 	return base
 }
@@ -666,12 +743,11 @@ func (m *Model) viewStatus() string {
 	var b strings.Builder
 	b.WriteString(styleHeader.Render("Counters") + "\n")
 	rows := [][2]string{
-		{"allowed (direct)", fmt.Sprint(st[0])},
+		{"direct", fmt.Sprint(st[0])},
 		{"proxied", fmt.Sprint(st[1])},
 		{"blocked", fmt.Sprint(st[2])},
 		{"tcp proxied", fmt.Sprint(st[3])},
 		{"udp proxied", fmt.Sprint(st[4])},
-		{"loopback skipped", fmt.Sprint(st[5])},
 	}
 	for _, r := range rows {
 		b.WriteString(fmt.Sprintf("  %-20s %s\n", r[0], r[1]))
@@ -681,6 +757,7 @@ func (m *Model) viewStatus() string {
 	b.WriteString(fmt.Sprintf("  %-20s %s\n", "tcp relay", fmt.Sprintf("127.0.0.1:%d", m.cfg.TCPRelayPort)))
 	b.WriteString(fmt.Sprintf("  %-20s %s\n", "udp relay", fmt.Sprintf("127.0.0.1:%d", m.cfg.UDPRelayPort)))
 	b.WriteString(fmt.Sprintf("  %-20s %s\n", "cgroup", m.cfg.CgroupPath))
+	b.WriteString(fmt.Sprintf("  %-20s %s\n", "log level", logLevelName(m.cfg.LogLevel)))
 	return b.String()
 }
 
@@ -708,19 +785,70 @@ func (m *Model) viewRules() string {
 	return b.String()
 }
 
-func (m *Model) viewLogs() string {
-	if len(m.logs) == 0 {
-		return styleOverlay.Render(" no traffic events yet") + "\n"
+// window returns up to max log lines ending at the current scroll offset
+// (0 = newest at the bottom).
+func (m *Model) window(max int) []string {
+	n := len(m.logs)
+	if n == 0 || max <= 0 {
+		return nil
 	}
+	off := m.logScroll
+	if off > n-max {
+		off = n - max
+	}
+	if off < 0 {
+		off = 0
+	}
+	end := n - off
+	start := end - max
+	if start < 0 {
+		start = 0
+	}
+	out := make([]string, end-start)
+	copy(out, m.logs[start:end])
+	return out
+}
+
+func (m *Model) viewLogs() string {
 	max := m.height - 12
 	if max < 3 {
 		max = 3
 	}
-	start := 0
-	if len(m.logs) > max {
-		start = len(m.logs) - max
+	lines := m.window(max)
+	if len(lines) == 0 {
+		return styleOverlay.Render(" no traffic events yet (set a log level in Settings; Enter for full screen)") + "\n"
 	}
-	return strings.Join(m.logs[start:], "\n") + "\n"
+	hint := fmt.Sprintf(" lines %d/%d · scroll %d · enter: fullscreen", len(lines), len(m.logs), m.logScroll)
+	return strings.Join(lines, "\n") + "\n" + styleOverlay.Render(hint) + "\n"
+}
+
+func (m *Model) viewFullLogs() string {
+	max := m.height - 2
+	if max < 1 {
+		max = 1
+	}
+	lines := m.window(max)
+	var b strings.Builder
+	b.WriteString(styleHeader.Render(" Traffic logs · j/k: scroll · g/G: top/bottom · c: clear · q: back ") + "\n")
+	if len(lines) == 0 {
+		b.WriteString(styleOverlay.Render(" no traffic events yet") + "\n")
+		return b.String()
+	}
+	return b.String() + strings.Join(lines, "\n") + "\n"
+}
+
+func logLevelName(l int) string {
+	switch l {
+	case 0:
+		return "OFF"
+	case 1:
+		return "BLOCK"
+	case 2:
+		return "PROXY"
+	case 3:
+		return "ALL"
+	}
+	return fmt.Sprint(l)
 }
 
 func (m *Model) viewSettings() string {

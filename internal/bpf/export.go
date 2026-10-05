@@ -1,7 +1,10 @@
 package bpf
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	"io"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -46,13 +49,45 @@ type Rule = proxyRule
 // DstInfo describes an intercepted flow.
 type DstInfo = proxyDstinfo
 
+// Event is a decision event pushed by the eBPF program (struct event in
+// proxy.bpf.c) for PROXY / DIRECT / BLOCK decisions.
+type Event struct {
+	Ts      uint64
+	Pid     uint32
+	Ip      uint32
+	Port    uint16
+	Proto   uint8
+	Action  uint8
+	RuleOrd uint32
+	Comm    [NameLen]uint8
+}
+
+// ParseEvent decodes a ring-buffer sample.
+func ParseEvent(raw []byte) (Event, error) {
+	var ev Event
+	if len(raw) < binary.Size(ev) {
+		return ev, io.ErrUnexpectedEOF
+	}
+	err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &ev)
+	return ev, err
+}
+
 // Config configures the eBPF manager.
 type Config struct {
 	CgroupPath    string
 	DefaultAction uint8
 	TCPRelayPort  uint16
 	UDPRelayPort  uint16
+	LogLevel      uint32
 }
+
+// Log levels (mirror the cfg_map log_level semantics).
+const (
+	LogOff    uint32 = 0
+	LogBlock  uint32 = 1
+	LogProxy  uint32 = 2
+	LogDirect uint32 = 3
+)
 
 // Manager owns the loaded eBPF objects and their attachments.
 type Manager struct {
@@ -107,6 +142,7 @@ func (m *Manager) setConfig(cfg Config) error {
 		DefaultAction: uint32(cfg.DefaultAction),
 		TcpRelayPort:  uint32(cfg.TCPRelayPort),
 		UdpRelayPort:  uint32(cfg.UDPRelayPort),
+		LogLevel:      cfg.LogLevel,
 	}
 	var cur proxyCfg
 	if err := m.objs.CfgMap.Lookup(uint32(0), &cur); err == nil {
@@ -127,6 +163,19 @@ func (m *Manager) SetDefaultAction(action uint8) error {
 	c.DefaultAction = uint32(action)
 	return m.objs.CfgMap.Update(uint32(0), &c, ebpf.UpdateAny)
 }
+
+// SetLogLevel changes how much traffic is pushed to the event ring buffer.
+func (m *Manager) SetLogLevel(level uint32) error {
+	var c proxyCfg
+	if err := m.objs.CfgMap.Lookup(uint32(0), &c); err != nil {
+		return err
+	}
+	c.LogLevel = level
+	return m.objs.CfgMap.Update(uint32(0), &c, ebpf.UpdateAny)
+}
+
+// EventsMap returns the decision-event ring buffer.
+func (m *Manager) EventsMap() *ebpf.Map { return m.objs.Events }
 
 // SetRules replaces the complete rule table.
 func (m *Manager) SetRules(rules []Rule) error {

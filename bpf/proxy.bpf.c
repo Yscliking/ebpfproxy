@@ -40,11 +40,12 @@ struct rule {
 	__u16 port_lo;	/* host order */
 	__u16 port_hi;	/* host order */
 	__u32 ord;	/* user-facing rule order, 1-based (for hit reporting) */
-	__u8  name[RULE_NAME_MAX]; /* prefix of comm OR executable basename */
+	__u8  name[RULE_NAME_MAX]; /* pattern matched against comm OR exe basename */
 	__u8  name_len;	/* 0 = any process */
 	__u8  proto;	/* PROTO_TCP | PROTO_UDP */
 	__u8  action;	/* ACTION_* */
 	__u8  enabled;
+	__u8  wildcard;	/* 1 = prefix match ('git*'), 0 = exact match ('git') */
 };
 
 struct cfg {
@@ -52,6 +53,19 @@ struct cfg {
 	__u32 default_action;
 	__u32 tcp_relay_port;
 	__u32 udp_relay_port;
+	__u32 log_level;	/* 0 off, 1 block, 2 +proxy, 3 +direct */
+};
+
+/* Decision event delivered to userspace through the ring buffer. */
+struct event {
+	__u64 ts;
+	__u32 pid;
+	__u32 ip;	/* network-order-as-u32 */
+	__u16 port;	/* host order */
+	__u8  proto;	/* PROTO_TCP | PROTO_UDP */
+	__u8  action;	/* ACTION_* */
+	__u32 rule_ord;
+	__u8  comm[NAME_LEN];
 };
 
 struct dstinfo {
@@ -105,6 +119,11 @@ struct {
 	__type(value, __u64);
 } stats SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 20);
+} events SEC(".maps");
+
 enum {
 	STAT_ALLOW = 0,
 	STAT_PROXY = 1,
@@ -121,19 +140,24 @@ static __always_inline void stat_inc(__u32 idx)
 		__sync_fetch_and_add(v, 1);
 }
 
-static __always_inline int prefix_match(const __u8 *s, __u8 slen,
-					const __u8 *pat, __u8 len)
+/* wildcard=1 -> prefix match ("git*"); wildcard=0 -> exact match ("git"). */
+static __always_inline int name_match(const __u8 *s, __u8 slen,
+				      const __u8 *pat, __u8 len, __u8 wildcard)
 {
 #pragma clang loop unroll(disable)
 	for (int i = 0; i < RULE_NAME_MAX; i++) {
-		if (i >= len)
-			return 1;
+		if (i >= len) {
+			if (wildcard)
+				return 1;
+			/* exact: source must end here */
+			return (i < slen && s[i] == 0) ? 1 : 0;
+		}
 		if (i >= slen)
 			return 0;
 		if (s[i] != pat[i])
 			return 0;
 	}
-	return 1;
+	return wildcard ? 1 : 0;
 }
 
 struct match_ctx {
@@ -152,11 +176,11 @@ struct match_ctx {
  * "Web Content", ...) but the executable stays "firefox", so exe matching is
  * what makes multi-process applications work. */
 static __always_inline int proc_match(struct match_ctx *m, const __u8 *pat,
-				      __u8 len)
+				      __u8 len, __u8 wildcard)
 {
-	if (prefix_match(m->comm, NAME_LEN, pat, len))
+	if (name_match(m->comm, NAME_LEN, pat, len, wildcard))
 		return 1;
-	if (prefix_match(m->exe, RULE_NAME_MAX, pat, len))
+	if (name_match(m->exe, RULE_NAME_MAX, pat, len, wildcard))
 		return 1;
 	return 0;
 }
@@ -189,7 +213,7 @@ static long match_rule_cb(__u32 i, void *data)
 		return 0;
 	if (!(r->proto & m->proto))
 		return 0;
-	if (r->name_len > 0 && !proc_match(m, r->name, r->name_len))
+	if (r->name_len > 0 && !proc_match(m, r->name, r->name_len, r->wildcard))
 		return 0;
 	if (r->mask != 0 && ((m->ip & r->mask) != (r->ip & r->mask)))
 		return 0;
@@ -251,6 +275,41 @@ static __always_inline void fill_dstinfo(struct dstinfo *di, __u32 ip,
 		di->comm[i] = comm[i];
 }
 
+/* Push a decision event to userspace, subject to the configured log level. */
+static __always_inline void emit_event(__u8 action, __u8 proto, __u32 ip,
+				       __u32 nport, __u32 rule_ord,
+				       const __u8 *comm)
+{
+	__u32 zero = 0;
+	struct cfg *c = bpf_map_lookup_elem(&cfg_map, &zero);
+	__u32 lvl = c ? c->log_level : 0;
+	int want;
+
+	if (action == ACTION_BLOCK)
+		want = lvl >= 1;
+	else if (action == ACTION_PROXY)
+		want = lvl >= 2;
+	else
+		want = lvl >= 3;
+	if (!want)
+		return;
+
+	struct event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	if (!e)
+		return;
+	e->ts = bpf_ktime_get_ns();
+	e->pid = bpf_get_current_pid_tgid() >> 32;
+	e->ip = ip;
+	e->port = bpf_ntohs((__u16)nport);
+	e->proto = proto;
+	e->action = action;
+	e->rule_ord = rule_ord;
+#pragma clang loop unroll(full)
+	for (int i = 0; i < NAME_LEN; i++)
+		e->comm[i] = comm[i];
+	bpf_ringbuf_submit(e, 0);
+}
+
 /*
  * Common decision routine for the connect()/sendmsg() sock_addr hooks.
  * returns 0 to allow, non-zero to allow (rewriting when needed).
@@ -260,6 +319,8 @@ static __always_inline int decide4(struct bpf_sock_addr *ctx, __u8 want_proto,
 				   __u8 connected, int record_by_port, int *blocked)
 {
 	__u8 comm[NAME_LEN] = {};
+	__u8 exe[RULE_NAME_MAX] = {};
+	__u8 pname[NAME_LEN] = {};
 	struct dstinfo di = {};
 	__u32 ip = ctx->user_ip4;
 	__u16 port = bpf_ntohs((__u16)ctx->user_port);
@@ -269,21 +330,30 @@ static __always_inline int decide4(struct bpf_sock_addr *ctx, __u8 want_proto,
 	*blocked = 0;
 	bpf_get_current_comm(comm, NAME_LEN);
 
-	/* Never touch non-global-unicast traffic: loopback (proxy loops), and
-	 * multicast / broadcast / reserved (mDNS, SSDP, DHCP, ...) which cannot
-	 * and must not be sent to a SOCKS5 proxy. */
-	__u8 b0 = ip & 0xff;
-	if (b0 == LOOPBACK_BYTE || b0 >= 0xe0 || ip == 0) {
-		stat_inc(STAT_LOOP);
-		return 1;
-	}
-	/* 169.254.0.0/16 link-local (network byte order packed little-endian). */
-	if ((ip & 0xffff) == 0xfea9) {
-		stat_inc(STAT_LOOP);
-		return 1;
+	/* Report the executable basename rather than the kernel thread name
+	 * ("firefox" instead of "Socket Thread"). Fall back to comm. */
+	read_exe(exe);
+	if (exe[0]) {
+#pragma clang loop unroll(full)
+		for (int i = 0; i < NAME_LEN; i++)
+			pname[i] = exe[i];
+	} else {
+#pragma clang loop unroll(full)
+		for (int i = 0; i < NAME_LEN; i++)
+			pname[i] = comm[i];
 	}
 
 	action = match_rules(comm, ip, port, want_proto, &rule_ord);
+
+	__u32 zero = 0;
+	struct cfg *c = bpf_map_lookup_elem(&cfg_map, &zero);
+	__u32 relay = 0;
+	if (c)
+		relay = (want_proto == PROTO_UDP) ? c->udp_relay_port : c->tcp_relay_port;
+	if (action == ACTION_PROXY && (!c || relay == 0))
+		action = ACTION_DIRECT;
+
+	emit_event(action, want_proto, ip, ctx->user_port, rule_ord, pname);
 
 	if (action == ACTION_BLOCK) {
 		stat_inc(STAT_BLOCK);
@@ -295,17 +365,7 @@ static __always_inline int decide4(struct bpf_sock_addr *ctx, __u8 want_proto,
 		return 1;
 	}
 
-	__u32 zero = 0;
-	struct cfg *c = bpf_map_lookup_elem(&cfg_map, &zero);
-	__u32 relay = 0;
-	if (c)
-		relay = (want_proto == PROTO_UDP) ? c->udp_relay_port : c->tcp_relay_port;
-	if (!c || relay == 0) {
-		stat_inc(STAT_ALLOW);
-		return 1;
-	}
-
-	fill_dstinfo(&di, ip, ctx->user_port, connected, rule_ord, comm);
+	fill_dstinfo(&di, ip, ctx->user_port, connected, rule_ord, pname);
 
 	if (record_by_port) {
 		/* sendmsg4: local port is already assigned. */

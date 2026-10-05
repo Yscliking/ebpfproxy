@@ -58,11 +58,12 @@ struct rule {
     __u16 port_lo;     /* host order */
     __u16 port_hi;     /* host order */
     __u32 ord;         /* user rule order, 1-based (for hit reporting) */
-    __u8  name[64];    /* process name prefix */
+    __u8  name[64];    /* process pattern */
     __u8  name_len;    /* 0 = any process */
     __u8  proto;       /* PROTO_TCP | PROTO_UDP */
     __u8  action;      /* ACTION_PROXY | ACTION_DIRECT | ACTION_BLOCK */
     __u8  enabled;
+    __u8  wildcard;    /* 1 = prefix ("git*"), 0 = exact ("git") */
 };
 ```
 
@@ -72,7 +73,8 @@ verifier's "infinite loop detected" error (the induction variable was spilled
 to the stack). The callback receives a **stack pointer** as context (the
 verifier rejects a map-value pointer there).
 
-`proc_match()` compares the rule prefix against **two** strings:
+`proc_match()` compares the rule name against **two** strings (exact or prefix
+depending on `wildcard`):
 
 1. `ctx->comm` (`bpf_get_current_comm`, 16 bytes), and
 2. `ctx->exe`, the executable basename read once with
@@ -147,24 +149,46 @@ Replies are routed by the SOCKS5 remote source address:
 A single association is shared to avoid per-datagram handshake churn (which made
 UDP flaky). Idle flows are garbage collected after 120 s.
 
-## 6. Guards and rule order
+## 6. No hidden bypass, rule order and events
 
-There are **no hidden process rules**. Every process/host/port decision is a
-normal user rule (see `internal/rule`), and the only implicit guards are for
-traffic that can never be proxied or must not be redirected:
+There are **no hidden rules and no implicit bypasses**. Every flow — including
+loopback, multicast/broadcast and link-local — is decided by the rule table and
+the default action. In particular, with a catch-all/default `PROXY` you must add
+`DIRECT` rules for loopback and for the proxy process, otherwise the relay's own
+connection to the proxy is redirected back into the relay and loops.
 
-- Loopback (`127.0.0.0/8`) is never rewritten → no proxy loops and the relay can
-  reach the proxy (which usually listens on loopback).
-- Multicast/broadcast/reserved (first octet `>= 0xe0`), `0.0.0.0` and link-local
-  (`169.254.0.0/16`) are always DIRECT; mDNS/SSDP/DHCP cannot be proxied.
-- Programs are attached to cgroup fds; if the process dies, the fds close and
-  the hooks detach automatically.
+Consequence: the eBPF program must never be relied on to protect the tool
+itself. This is a deliberate change from v0.1.x (which forced loopback and
+non-unicast DIRECT).
 
 Rules are evaluated in array order, top to bottom, and the **first match wins**
-(`bpf_loop` stops at the first matching callback). The kernel rule array order
-is the user list order produced by `rule.Expand`, and each entry stores the
-user rule's order (`ord`, 1-based) so the matched rule number can be reported.
+(`bpf_loop` stops at the first matching callback). Each entry stores the user
+rule's order (`ord`, 1-based) so the matched rule number can be reported.
 Reordering in the UI simply rewrites the array.
+
+Process matching supports both exact and prefix patterns via a per-rule
+`wildcard` byte: `git` (wildcard=0) matches only `git`, `git*` (wildcard=1)
+matches any `git...`.
+
+### Decision events
+
+Every decision is pushed to a `BPF_MAP_TYPE_RINGBUF` named `events`
+(`bpf/proxy.bpf.c: struct event`). The payload carries timestamp, pid, ip, port,
+protocol, action, matched rule order and the **executable basename** (read in
+kernel, falling back to `comm`). Userspace reads it with
+`github.com/cilium/ebpf/ringbuf` and turns each record into a UI event.
+
+Emission is gated by `cfg.log_level` so no work is done when logging is reduced:
+
+| level | logged |
+|-------|--------|
+| 0 off | nothing |
+| 1 block | BLOCK |
+| 2 proxy (default) | BLOCK + PROXY |
+| 3 all | BLOCK + PROXY + DIRECT |
+
+Programs are attached to cgroup fds; if the process dies, the fds close and the
+hooks detach automatically.
 
 ## 7. Concurrency
 

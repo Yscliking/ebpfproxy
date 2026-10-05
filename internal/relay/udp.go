@@ -28,10 +28,11 @@ var debugUDP = os.Getenv("EBPFPROXY_DEBUG") != ""
 // Replies to unconnected sockets are sent with the original remote address
 // spoofed as the source so proxy-unaware applications keep working.
 type UDPRelay struct {
-	Addr   string
-	Proxy  *socks.Client
-	Peek   func(port uint32) (bpf.DstInfo, bool)
-	Events chan<- Event
+	Addr    string
+	Proxy   *socks.Client
+	Peek    func(port uint32) (bpf.DstInfo, bool)
+	Resolve func(pid uint32) string
+	Events  chan<- Event
 
 	conn *net.UDPConn
 
@@ -135,11 +136,6 @@ func (r *UDPRelay) dispatch(client *net.UDPAddr, data []byte) {
 		rc[flow] = struct{}{}
 	}
 	r.mu.Unlock()
-
-	if !exists {
-		r.emit(Event{Time: time.Now(), Proto: "UDP", Action: "PROXY", Rule: di.RuleOrd,
-			Pid: di.Pid, Process: commString(di.Comm[:]), Dst: dst.String()})
-	}
 
 	assoc, err := r.ensureAssoc()
 	if err != nil {
@@ -336,8 +332,12 @@ func (r *UDPRelay) emitErr(di bpf.DstInfo, dst string, err error) {
 	r.errSeen[key] = time.Now()
 	r.errMu.Unlock()
 
+	proc := commString(di.Comm[:])
+	if proc == "" && r.Resolve != nil {
+		proc = r.Resolve(di.Pid)
+	}
 	r.emit(Event{Time: time.Now(), Proto: "UDP", Action: "PROXY", Rule: di.RuleOrd,
-		Pid: di.Pid, Process: commString(di.Comm[:]), Dst: dst, Err: err.Error()})
+		Pid: di.Pid, Process: proc, Dst: dst, Err: err.Error()})
 }
 
 // Close stops the relay and tears down all flows.

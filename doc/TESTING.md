@@ -159,7 +159,7 @@ There are no hardcoded process rules, so add a `DIRECT` rule yourself for the
 processes that must stay up. Rules are top-to-bottom, first match wins.
 
 ```sh
-./ebpfproxy --headless \
+./ebpfproxy --default-action DIRECT --headless \
     --rule 'opencode:*:*:BOTH:DIRECT' \
     --rule '*:*:*:BOTH:BLOCK' & PID=$!; sleep 1.5
 ./probenet opencode tcp 172.66.147.243 443    # expect OK (rule #1 DIRECT)
@@ -174,7 +174,7 @@ Use a destination that is blocked directly but works through the proxy
 (`1.1.1.1:443` here).
 
 ```sh
-./ebpfproxy --headless --proxy 127.0.0.1:1080 --rule 'victim:*:*:TCP:PROXY' & PID=$!; sleep 1.5
+./ebpfproxy --default-action DIRECT --headless --proxy 127.0.0.1:1080 --rule 'victim:*:*:TCP:PROXY' & PID=$!; sleep 1.5
 ./probenet victim tcp 1.1.1.1 443    # expect OK   (proxied)
 ./probenet normal tcp 1.1.1.1 443    # expect TIMEOUT (direct)
 kill $PID
@@ -183,7 +183,7 @@ kill $PID
 ### 3. UDP PROXY
 
 ```sh
-./ebpfproxy --headless --proxy 127.0.0.1:1080 --rule 'victim:*:53:UDP:PROXY' & PID=$!; sleep 1.5
+./ebpfproxy --default-action DIRECT --headless --proxy 127.0.0.1:1080 --rule 'victim:*:53:UDP:PROXY' & PID=$!; sleep 1.5
 ./probenet victim udpu 8.8.8.8 53    # expect OK from=8.8.8.8:53 (spoofed source)
 ./probenet victim udpc 8.8.8.8 53    # expect OK from=127.0.0.1:15002 (relay source)
 ./probenet normal udpc 8.8.8.8 53    # expect OK from=8.8.8.8:53 (direct)
@@ -193,11 +193,11 @@ kill $PID
 ### 4. Firefox (executable-basename matching)
 
 ```sh
-./ebpfproxy --headless --proxy 127.0.0.1:1080 --rule 'firefox:*:*:TCP:PROXY' & PID=$!; sleep 1.5
+./ebpfproxy --default-action DIRECT --headless --proxy 127.0.0.1:1080 --rule 'firefox:*:*:TCP:PROXY' & PID=$!; sleep 1.5
 ./firefox     # parent OK, child OK  (both proxied)
 kill $PID
 
-./ebpfproxy --headless --rule 'firefox:*:*:TCP:BLOCK' & PID=$!; sleep 1.5
+./ebpfproxy --default-action DIRECT --headless --rule 'firefox:*:*:TCP:BLOCK' & PID=$!; sleep 1.5
 ./firefox     # parent EPERM, child EPERM
 kill $PID
 ```
@@ -205,7 +205,7 @@ kill $PID
 ### 5. Crash cleanup
 
 ```sh
-./ebpfproxy --headless --rule '*:*:*:BOTH:BLOCK' & PID=$!; sleep 1.5
+./ebpfproxy --default-action DIRECT --headless --rule '*:*:*:BOTH:BLOCK' & PID=$!; sleep 1.5
 ./probenet victim tcp 172.66.147.243 443   # FAIL (blocked)
 kill -9 $PID; sleep 1
 ./probenet victim tcp 172.66.147.243 443   # OK (hooks detached)

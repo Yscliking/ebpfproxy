@@ -144,7 +144,10 @@ ctx->user_ip4  = bpf_htonl(0x7f000001);
 ctx->user_port = bpf_htons(relay_port);
 ```
 
-Add the guards (loopback, multicast, link-local) **before** rule lookup.
+Do **not** add hidden bypasses. Every flow (loopback, multicast, link-local
+included) must go through the rule engine so the user stays in control; the
+cost is that with a catch-all PROXY the user must add DIRECT rules for loopback
+and the proxy process.
 
 ## 3. Generate Go bindings
 

@@ -19,7 +19,7 @@ import (
 	"ebpfproxy/internal/tui"
 )
 
-const version = "0.1.3"
+const version = "0.2.0"
 
 type stringSlice []string
 
@@ -37,6 +37,7 @@ func main() {
 		tcpPort       = flag.Uint("tcp-relay-port", 0, "local TCP relay port")
 		udpPort       = flag.Uint("udp-relay-port", 0, "local UDP relay port")
 		cgroupPath    = flag.String("cgroup", "", "cgroup v2 path to attach hooks to")
+		logLevel      = flag.String("log-level", "", "log level: off, block, proxy or all")
 		headless      = flag.Bool("headless", false, "run without the TUI")
 		showVersion   = flag.Bool("version", false, "print version and exit")
 		showHelp      = flag.Bool("help", false, "show help and exit")
@@ -78,6 +79,14 @@ func main() {
 	if *cgroupPath != "" {
 		cfg.CgroupPath = *cgroupPath
 	}
+	if *logLevel != "" {
+		lv, err := parseLogLevel(*logLevel)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid --log-level: %v\n", err)
+			os.Exit(2)
+		}
+		cfg.LogLevel = lv
+	}
 
 	if len(rulesFlag) > 0 {
 		cfg.Rules = nil
@@ -107,6 +116,7 @@ func main() {
 		DefaultAction: da,
 		TCPRelayPort:  cfg.TCPRelayPort,
 		UDPRelayPort:  cfg.UDPRelayPort,
+		LogLevel:      uint32(cfg.LogLevel),
 		Rules:         cfg.Rules,
 	})
 
@@ -173,6 +183,8 @@ OPTIONS
   --udp-relay-port <n>    Local UDP relay port (default 15002)
   --cgroup <path>         cgroup v2 path to attach the hooks to
                           Default: /sys/fs/cgroup
+  --log-level <level>     Traffic log level: off, block, proxy or all
+                          Default: proxy
   --config <path>         Config file
                           Default: ~/.config/ebpfproxy/config.json
   --headless              Run without the TUI (events printed to stdout)
@@ -182,9 +194,10 @@ OPTIONS
 RULE SYNTAX
   process:hosts:ports:protocol:action
 
-    process   name or prefix, matched against the task name (comm) OR the
-              executable basename; '*' = any; multiple with ';' or ','
-              e.g. curl   firefox   cur*   curl;wget   *
+    process   name, matched against the task name (comm) OR executable
+              basename. 'git' matches only "git"; 'git*' matches any prefix;
+              '*' = any; multiple with ';' or ','
+              e.g. git   git*   firefox   curl;wget   *
     hosts     IPv4 address, CIDR, hostname, or '*'; multiple with ';' or ','
               e.g. 1.1.1.1   10.0.0.0/8   example.com   192.168.*.*
     ports     single port, range, or '*'; multiple with ';' or ','
@@ -196,9 +209,19 @@ RULE SYNTAX
   ignored. The connection log reports which rule order matched (rule #N). In
   the TUI press k / j to move the selected rule up / down.
 
-IMPLICIT GUARDS (always DIRECT, cannot be overridden)
-  - loopback 127.0.0.0/8
-  - multicast / broadcast / reserved and link-local 169.254.0.0/16
+NO IMPLICIT BYPASS
+  Every flow (including loopback, broadcast and link-local) is decided by the
+  rules and the default action. If you use a catch-all PROXY/default PROXY, add
+  DIRECT rules for loopback and your proxy process, e.g.:
+      --rule '*:127.0.0.1;localhost:*:BOTH:DIRECT'
+      --rule 'v2ray:*:*:BOTH:DIRECT'
+  otherwise the relay's own connection to the proxy would loop.
+
+LOG LEVELS
+  off    no traffic events
+  block  blocked flows only
+  proxy  blocked + proxied flows (default)
+  all    blocked + proxied + direct flows
 
 EXAMPLES
   # TUI (rules are saved to the config file)
@@ -222,6 +245,20 @@ NOTES
   - IPv4 only.
   - Hooks detach automatically on exit; 'kill -9' leaves nothing behind.
 `, version)
+}
+
+func parseLogLevel(s string) (int, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "off", "0":
+		return 0, nil
+	case "block", "1":
+		return 1, nil
+	case "proxy", "2":
+		return 2, nil
+	case "all", "3":
+		return 3, nil
+	}
+	return 0, fmt.Errorf("want off, block, proxy or all")
 }
 
 func parseProxy(s string) (addr, user, pass string) {
