@@ -1,0 +1,21 @@
+# built binary
+/ebpfproxy
+
+# kernel BTF dump (regenerate with `make vmlinux`)
+/bpf/vmlinux.h
+
+# go test / coverage output
+*.test
+*.out
+coverage.txt
+
+# local task notes
+/task
+
+# editors and OS junk
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
